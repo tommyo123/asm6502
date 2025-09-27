@@ -12,6 +12,9 @@
 *.iml
 out/
 
+# ---- VS Code ----
+.vscode/
+
 # ---- Build artifacts ----
 *.bin
 *.o
@@ -20,11 +23,9 @@ out/
 *.dll
 *.exe
 *.pdb
-
-# ---- Generated test artifacts ----
-listing.txt
-test_output.bin
-out.bin
+*.out
+*.a
+*.lib
 
 # ---- OS specific ----
 .DS_Store
@@ -36,5 +37,26 @@ Desktop.ini
 *~
 *.swp
 *.swo
+*.swn
 *.tmp
 *.bak
+
+# Emacs
+\#*\#
+.\#*
+
+# ---- Windows installer / crash dumps ----
+*.msi
+*.cab
+*.msm
+*.msp
+*.lnk
+*.stackdump
+
+# ---- Ignore lockfile at workspace root ----
+/Cargo.lock
+
+# ---- Generated test artifacts ----
+listing.txt
+test_output.bin
+out.bin
