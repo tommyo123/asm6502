@@ -14,6 +14,11 @@ out/
 
 # ---- VS Code ----
 .vscode/
+.history/
+
+# ---- Sublime Text ----
+*.sublime-workspace
+*.sublime-project
 
 # ---- Build artifacts ----
 *.bin
@@ -55,6 +60,9 @@ Desktop.ini
 
 # ---- Ignore lockfile at workspace root ----
 /Cargo.lock
+
+# Qodo editor config
+.qodo/
 
 # ---- Generated test artifacts ----
 listing.txt
