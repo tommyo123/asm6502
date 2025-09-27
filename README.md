@@ -48,13 +48,13 @@ Add a Git dependency in your project's `Cargo.toml`:
 
 ```toml
 [dependencies]
-asm6502 = { git = "https://github.com/<your-username>/asm6502" }
+asm6502 = { git = "https://github.com/tommyo123/asm6502" }
 ```
 
 Optionally enable the listing feature:
 
 ```toml
-asm6502 = { git = "https://github.com/<your-username>/asm6502", features = ["listing"] }
+asm6502 = { git = "https://github.com/tommyo123/asm6502", features = ["listing"] }
 ```
 
 Minimal example:
