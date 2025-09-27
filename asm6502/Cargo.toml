@@ -1,0 +1,14 @@
+[package]
+name = "asm6502"
+version = "1.0.0"
+edition = "2024"
+
+[features]
+default = []
+listing = []
+
+[lib]
+name = "asm6502"
+path = "src/Assembler6502.rs"
+
+[dependencies]
