@@ -1,0 +1,118 @@
+//! Lexer and parser for assembly source lines
+
+use super::expression::{Expr, ExpressionParser};
+
+#[derive(Clone, Debug)]
+pub enum Item {
+    Instruction {
+        mnemonic: String,
+        operand: Option<String>  // Keep as String for now - parse in assembler
+    },
+    Label(String),
+    Constant(String, Expr),  // NEW: LABEL = value
+    Data(Vec<Expr>),
+    Org(Expr),
+}
+
+#[derive(Clone, Debug)]
+pub enum Either<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+/// Parse entire source into a list of Items
+pub fn parse_source(source: &str) -> Result<Vec<Item>, String> {
+    let mut instructions = Vec::new();
+    for raw in source.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(parsed) = parse_line(&line)? {
+            match parsed {
+                Either::Many(list) => instructions.extend(list),
+                Either::One(item) => instructions.push(item),
+            }
+        }
+    }
+    Ok(instructions)
+}
+
+/// Parse a single line into an Item
+pub fn parse_line(line: &str) -> Result<Option<Either<Item>>, String> {
+    let l = line.split(';').next().unwrap_or("").trim();
+    if l.is_empty() {
+        return Ok(None);
+    }
+
+    // Label with DCB on same line: "label: DCB $01 $02"
+    if l.contains(':') && l.contains("DCB") {
+        let mut parts = l.split(':');
+        let label = parts.next().unwrap().trim().to_string();
+        let rest = parts.next().unwrap_or("").trim();
+        if rest.starts_with("DCB") {
+            let data_exprs: Vec<Expr> = rest[3..]
+                .split_whitespace()
+                .map(|s| ExpressionParser::parse(s))
+                .collect::<Result<_, _>>()?;
+            return Ok(Some(Either::Many(vec![
+                Item::Label(label),
+                Item::Data(data_exprs),
+            ])));
+        }
+    }
+
+    // Simple label: "label:"
+    if l.ends_with(':') {
+        return Ok(Some(Either::One(Item::Label(
+            l[..l.len() - 1].to_string(),
+        ))));
+    }
+
+    // Constant assignment: "LABEL = value" or "LABEL = *+1"
+    if l.contains('=') && !l.starts_with('*') {
+        let parts: Vec<&str> = l.splitn(2, '=').collect();
+        if parts.len() == 2 {
+            let name = parts[0].trim();
+            let value_str = parts[1].trim();
+
+            // Validate label name
+            if !name.is_empty() && name.chars().next().unwrap().is_ascii_alphabetic() {
+                let expr = ExpressionParser::parse(value_str)?;
+                return Ok(Some(Either::One(Item::Constant(name.to_string(), expr))));
+            }
+        }
+    }
+
+    // Origin directive: "*=$0800"
+    if let Some(rest) = l.strip_prefix("*=") {
+        let expr = ExpressionParser::parse(rest.trim())?;
+        return Ok(Some(Either::One(Item::Org(expr))));
+    }
+
+    // Data directive: "DCB $01 $02 $03"
+    if l.starts_with("DCB") {
+        let data: Vec<Expr> = l[3..]
+            .split_whitespace()
+            .map(|s| ExpressionParser::parse(s))
+            .collect::<Result<_, _>>()?;
+        return Ok(Some(Either::One(Item::Data(data))));
+    }
+
+    // Instruction: "LDA #$42" or "NOP"
+    let parts: Vec<&str> = l.split_whitespace().collect();
+    match parts.len() {
+        1 => Ok(Some(Either::One(Item::Instruction {
+            mnemonic: parts[0].to_string(),
+            operand: None,
+        }))),
+        2 => {
+            // Keep operand as string - will be parsed in assembler
+            Ok(Some(Either::One(Item::Instruction {
+                mnemonic: parts[0].to_string(),
+                operand: Some(parts[1].to_string()),
+            })))
+        }
+        _ => Err(format!("Invalid line: {}", l)),
+    }
+}

@@ -1,14 +1,12 @@
 [package]
 name = "asm6502"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
+
+[lib]
+name = "asm6502"
+path = "src/lib.rs"    # <-- RETT PATH!
 
 [features]
 default = []
 listing = []
-
-[lib]
-name = "asm6502"
-path = "src/Assembler6502.rs"
-
-[dependencies]
