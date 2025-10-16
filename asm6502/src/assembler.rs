@@ -1,5 +1,7 @@
 //! Main assembler implementation
 
+use std::fs;
+
 #[cfg(feature = "listing")]
 use std::fs::File;
 #[cfg(feature = "listing")]
@@ -107,6 +109,34 @@ impl Assembler6502 {
                         pc = pc.wrapping_add(1);
                     }
                 }
+                Item::Words(exprs) => {
+                    let eval = ExpressionEvaluator::new(&self.symbols, pc);
+                    for expr in exprs {
+                        eval.evaluate(expr).map_err(AsmError::Asm)?;
+                        map.push((idx, pc));
+                        idx += 1;
+                        pc = pc.wrapping_add(1);
+                        map.push((idx, pc));
+                        idx += 1;
+                        pc = pc.wrapping_add(1);
+                    }
+                }
+                Item::String(s) => {
+                    for _ in s.bytes() {
+                        map.push((idx, pc));
+                        idx += 1;
+                        pc = pc.wrapping_add(1);
+                    }
+                }
+                Item::IncBin(filename) => {
+                    if let Ok(bytes) = fs::read(filename) {
+                        for _ in bytes {
+                            map.push((idx, pc));
+                            idx += 1;
+                            pc = pc.wrapping_add(1);
+                        }
+                    }
+                }
                 Item::Org(expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, pc);
                     pc = eval.evaluate(expr).map_err(AsmError::Asm)?;
@@ -199,6 +229,30 @@ impl Assembler6502 {
                     for expr in exprs {
                         let val = eval.evaluate(expr)?;
                         machine.push((val & 0xFF) as u8);
+                        current_address = current_address.wrapping_add(1);
+                    }
+                }
+                Item::Words(exprs) => {
+                    let eval = ExpressionEvaluator::new(&self.symbols, current_address);
+                    for expr in exprs {
+                        let val = eval.evaluate(expr)?;
+                        // Little-endian: low byte first, then high byte
+                        machine.push((val & 0xFF) as u8);
+                        machine.push((val >> 8) as u8);
+                        current_address = current_address.wrapping_add(2);
+                    }
+                }
+                Item::String(s) => {
+                    for byte in s.bytes() {
+                        machine.push(byte);
+                        current_address = current_address.wrapping_add(1);
+                    }
+                }
+                Item::IncBin(filename) => {
+                    let bytes = fs::read(filename)
+                        .map_err(|e| format!("Failed to read {}: {}", filename, e))?;
+                    for byte in bytes {
+                        machine.push(byte);
                         current_address = current_address.wrapping_add(1);
                     }
                 }
@@ -454,6 +508,15 @@ impl Assembler6502 {
                 Ok(3)
             }
             Item::Data(exprs) => Ok(exprs.len()),
+            Item::Words(exprs) => Ok(exprs.len() * 2),  // 2 bytes per word
+            Item::String(s) => Ok(s.len()),
+            Item::IncBin(filename) => {
+                // Try to get file size, or return error
+                match fs::metadata(filename) {
+                    Ok(metadata) => Ok(metadata.len() as usize),
+                    Err(_) => Err(format!("Cannot read file: {}", filename)),
+                }
+            }
             Item::Org(_) | Item::Label(_) | Item::Constant(_, _) => Ok(0),
         }
     }
@@ -603,10 +666,72 @@ impl Assembler6502 {
                         .join(" ");
                     let hex_padded = format!("{:<12}", hex_data.clone());
                     println!(
-                        "${:04X}: {} DCB {}",
+                        "${:04X}: {} .byte {}",
                         current_address, hex_padded, hex_data
                     );
                     current_address = current_address.wrapping_add(bytes.len() as u16);
+                }
+                Item::Words(exprs) => {
+                    let eval = ExpressionEvaluator::new(&self.symbols, current_address);
+                    let words: Vec<u16> = exprs.iter()
+                        .filter_map(|e| eval.evaluate(e).ok())
+                        .collect();
+                    let bytes: Vec<u8> = words.iter()
+                        .flat_map(|&w| vec![(w & 0xFF) as u8, (w >> 8) as u8])
+                        .collect();
+                    let hex_data = bytes
+                        .iter()
+                        .map(|b| format!("${:02X}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let hex_padded = format!("{:<12}", hex_data);
+                    let word_data = words
+                        .iter()
+                        .map(|w| format!("${:04X}", w))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    println!(
+                        "${:04X}: {} .word {}",
+                        current_address, hex_padded, word_data
+                    );
+                    current_address = current_address.wrapping_add(bytes.len() as u16);
+                }
+                Item::String(s) => {
+                    let bytes: Vec<u8> = s.bytes().collect();
+                    let hex_data = bytes
+                        .iter()
+                        .take(6)
+                        .map(|b| format!("${:02X}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut hex_padded = format!("{:<12}", hex_data);
+                    if bytes.len() > 6 {
+                        hex_padded = format!("{}...", hex_padded);
+                    }
+                    println!(
+                        "${:04X}: {} .string \"{}\"",
+                        current_address, hex_padded, s
+                    );
+                    current_address = current_address.wrapping_add(bytes.len() as u16);
+                }
+                Item::IncBin(filename) => {
+                    if let Ok(bytes) = fs::read(filename) {
+                        let hex_preview = bytes
+                            .iter()
+                            .take(6)
+                            .map(|b| format!("${:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let mut hex_padded = format!("{:<12}", hex_preview);
+                        if bytes.len() > 6 {
+                            hex_padded = format!("{}...", hex_padded);
+                        }
+                        println!(
+                            "${:04X}: {} .incbin \"{}\" ({} bytes)",
+                            current_address, hex_padded, filename, bytes.len()
+                        );
+                        current_address = current_address.wrapping_add(bytes.len() as u16);
+                    }
                 }
             }
         }
@@ -669,8 +794,65 @@ impl Assembler6502 {
                         .collect::<Vec<_>>()
                         .join(" ");
                     let hex_padded = format!("{:<12}", hex_data.clone());
-                    writeln!(f, "${:04X}: {} DCB {}", current_address, hex_padded, hex_data)?;
+                    writeln!(f, "${:04X}: {} .byte {}", current_address, hex_padded, hex_data)?;
                     current_address = current_address.wrapping_add(bytes.len() as u16);
+                }
+                Item::Words(exprs) => {
+                    let eval = ExpressionEvaluator::new(&self.symbols, current_address);
+                    let words: Vec<u16> = exprs.iter()
+                        .filter_map(|e| eval.evaluate(e).ok())
+                        .collect();
+                    let bytes: Vec<u8> = words.iter()
+                        .flat_map(|&w| vec![(w & 0xFF) as u8, (w >> 8) as u8])
+                        .collect();
+                    let hex_data = bytes
+                        .iter()
+                        .map(|b| format!("${:02X}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let hex_padded = format!("{:<12}", hex_data);
+                    let word_data = words
+                        .iter()
+                        .map(|w| format!("${:04X}", w))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    writeln!(f, "${:04X}: {} .word {}", current_address, hex_padded, word_data)?;
+                    current_address = current_address.wrapping_add(bytes.len() as u16);
+                }
+                Item::String(s) => {
+                    let bytes: Vec<u8> = s.bytes().collect();
+                    let hex_data = bytes
+                        .iter()
+                        .take(6)
+                        .map(|b| format!("${:02X}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut hex_padded = format!("{:<12}", hex_data);
+                    if bytes.len() > 6 {
+                        hex_padded = format!("{}...", hex_padded);
+                    }
+                    writeln!(f, "${:04X}: {} .string \"{}\"", current_address, hex_padded, s)?;
+                    current_address = current_address.wrapping_add(bytes.len() as u16);
+                }
+                Item::IncBin(filename) => {
+                    if let Ok(bytes) = fs::read(filename) {
+                        let hex_preview = bytes
+                            .iter()
+                            .take(6)
+                            .map(|b| format!("${:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        let mut hex_padded = format!("{:<12}", hex_preview);
+                        if bytes.len() > 6 {
+                            hex_padded = format!("{}...", hex_padded);
+                        }
+                        writeln!(
+                            f,
+                            "${:04X}: {} .incbin \"{}\" ({} bytes)",
+                            current_address, hex_padded, filename, bytes.len()
+                        )?;
+                        current_address = current_address.wrapping_add(bytes.len() as u16);
+                    }
                 }
             }
         }

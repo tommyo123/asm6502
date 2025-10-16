@@ -6,11 +6,14 @@ use super::expression::{Expr, ExpressionParser};
 pub enum Item {
     Instruction {
         mnemonic: String,
-        operand: Option<String>  // Keep as String for now - parse in assembler
+        operand: Option<String>
     },
     Label(String),
-    Constant(String, Expr),  // NEW: LABEL = value
-    Data(Vec<Expr>),
+    Constant(String, Expr),
+    Data(Vec<Expr>),           // DCB and .byte
+    Words(Vec<Expr>),          // .word (16-bit little-endian)
+    String(String),            // .string "text"
+    IncBin(String),            // .incbin "filename"
     Org(Expr),
 }
 
@@ -88,6 +91,44 @@ pub fn parse_line(line: &str) -> Result<Option<Either<Item>>, String> {
     if let Some(rest) = l.strip_prefix("*=") {
         let expr = ExpressionParser::parse(rest.trim())?;
         return Ok(Some(Either::One(Item::Org(expr))));
+    }
+
+    // .byte directive: ".byte $01,$02,$03"
+    if let Some(rest) = l.strip_prefix(".byte") {
+        let data: Vec<Expr> = rest
+            .split(',')
+            .map(|s| ExpressionParser::parse(s.trim()))
+            .collect::<Result<_, _>>()?;
+        return Ok(Some(Either::One(Item::Data(data))));
+    }
+
+    // .word directive: ".word $1000,$2000"
+    if let Some(rest) = l.strip_prefix(".word") {
+        let words: Vec<Expr> = rest
+            .split(',')
+            .map(|s| ExpressionParser::parse(s.trim()))
+            .collect::<Result<_, _>>()?;
+        return Ok(Some(Either::One(Item::Words(words))));
+    }
+
+    // .string directive: ".string "hello""
+    if let Some(rest) = l.strip_prefix(".string") {
+        let rest = rest.trim();
+        if rest.starts_with('"') && rest.ends_with('"') {
+            let string_content = &rest[1..rest.len() - 1];
+            return Ok(Some(Either::One(Item::String(string_content.to_string()))));
+        }
+        return Err("Invalid .string format, expected quotes".to_string());
+    }
+
+    // .incbin directive: ".incbin "filename.bin""
+    if let Some(rest) = l.strip_prefix(".incbin") {
+        let rest = rest.trim();
+        if rest.starts_with('"') && rest.ends_with('"') {
+            let filename = &rest[1..rest.len() - 1];
+            return Ok(Some(Either::One(Item::IncBin(filename.to_string()))));
+        }
+        return Err("Invalid .incbin format, expected quotes".to_string());
     }
 
     // Data directive: "DCB $01 $02 $03"

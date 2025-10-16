@@ -22,7 +22,10 @@ fn main() -> Result<(), AsmError> {
     // Test 6: Current address usage
     test_current_address()?;
 
-    // Test 7: Complete demo program
+    // Test 7: New directives (.byte, .word, .string)
+    test_new_directives()?;
+
+    // Test 8: Complete demo program
     test_complete_program()?;
 
     println!("\n✅ All tests passed successfully!");
@@ -281,8 +284,71 @@ end:
     Ok(())
 }
 
+fn test_new_directives() -> Result<(), AsmError> {
+    println!("📝 Test 7: New Directives (.byte, .word, .string)");
+    println!("{}", "=".repeat(50));
+
+    let mut assembler = Assembler6502::new();
+
+    let test_code = r#"
+*=$0800
+
+; .byte directive with comma separation
+data1:
+    .byte $FF,$FE,$FD
+
+; .word directive (16-bit little-endian)
+data2:
+    .word $1234,$5678
+
+; .string directive
+data3:
+    .string "HELLO"
+
+; Mixed usage
+    LDA data1
+    LDA data2
+    LDA #$42
+"#;
+
+    let bytes = assembler.assemble_bytes(test_code)?;
+
+    println!("✓ Assembled {} bytes", bytes.len());
+
+    // Verify .byte
+    assert_eq!(bytes[0], 0xFF, ".byte first value");
+    assert_eq!(bytes[1], 0xFE, ".byte second value");
+    assert_eq!(bytes[2], 0xFD, ".byte third value");
+
+    // Verify .word (little-endian!)
+    assert_eq!(bytes[3], 0x34, ".word $1234 low byte");
+    assert_eq!(bytes[4], 0x12, ".word $1234 high byte");
+    assert_eq!(bytes[5], 0x78, ".word $5678 low byte");
+    assert_eq!(bytes[6], 0x56, ".word $5678 high byte");
+
+    // Verify .string
+    assert_eq!(bytes[7], b'H', ".string 'H'");
+    assert_eq!(bytes[8], b'E', ".string 'E'");
+    assert_eq!(bytes[9], b'L', ".string 'L'");
+    assert_eq!(bytes[10], b'L', ".string 'L'");
+    assert_eq!(bytes[11], b'O', ".string 'O'");
+
+    println!("  Directives:");
+    println!("    .byte $FF,$FE,$FD → ${:02X} ${:02X} ${:02X}", bytes[0], bytes[1], bytes[2]);
+    println!("    .word $1234 → ${:02X} ${:02X} (little-endian)", bytes[3], bytes[4]);
+    println!("    .word $5678 → ${:02X} ${:02X} (little-endian)", bytes[5], bytes[6]);
+    println!("    .string \"HELLO\" → {} {} {} {} {}",
+             bytes[7] as char, bytes[8] as char, bytes[9] as char,
+             bytes[10] as char, bytes[11] as char);
+
+    println!("✓ All directive tests passed");
+    println!();
+
+    Ok(())
+}
+
 fn test_complete_program() -> Result<(), AsmError> {
-    println!("📝 Test 7: Complete Demo Program");
+    println!("📝 Test 8: Complete Demo Program");
     println!("{}", "=".repeat(50));
 
     let mut assembler = Assembler6502::new();
