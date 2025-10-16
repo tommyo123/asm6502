@@ -19,6 +19,11 @@ A minimal 6502 assembler written in Rust for inline assembly and lightweight com
     * Simple: `SCREEN = $0400`
     * Expressions: `OFFSET = BASE+$10`
     * Current address: `HERE = *`, `NEXT = *+1`
+* **Modern directives:**
+    * `.byte` - Comma-separated bytes
+    * `.word` - 16-bit words (little-endian)
+    * `.string` - ASCII text strings
+    * `.incbin` - Include binary files
 * **Label arithmetic:** Use labels in expressions (`LDA buffer+1`, `JMP start+3`)
 * **Current address symbol:** `*` represents the current program counter
 * **Addressing mode control:**
@@ -70,20 +75,64 @@ BASE = $1000
 OFFSET = BASE+$10   ; = $1010
 DOUBLE = SPRITE_X*2 ; = 200
 
-; Current address
+; Current address (*) constants
 HERE = *            ; Current program counter
 NEXT = *+1          ; Current PC + 1
+SKIP = *+3          ; Skip next instruction
 
-; Usage
+; Usage examples
     LDA #SPRITE_X
     STA SCREEN
-    JMP HERE
+    JMP HERE        ; Infinite loop
+
+; Practical use of *+offset
+skip_target:
+RETURN_ADDR = *+1   ; Address of next instruction
+    JSR subroutine  ; JSR is 3 bytes
+    NOP             ; This is at RETURN_ADDR
+    
+; Conditional skip pattern
+    LDA flag
+    BEQ skip_load   ; If zero, skip the load
+    LDA #$42        ; This gets skipped if flag=0
+skip_load:
+    STA result
 ```
 
 ### Directives
+
+#### Origin and Data
 ```asm
 *=$0800             ; Set origin (ORG)
-DCB $01 $02 $03     ; Define bytes
+DCB $01 $02 $03     ; Define bytes (space-separated, legacy)
+```
+
+#### Modern Data Directives
+```asm
+; .byte - Comma-separated bytes
+.byte $FF,$FE,$FD
+.byte $01,$02,$03,$04
+
+; .word - 16-bit words (little-endian)
+.word $1234         ; Assembles to: $34 $12
+.word $1234,$5678   ; Assembles to: $34 $12 $78 $56
+
+; .string - ASCII text
+.string "HELLO"     ; Assembles to: $48 $45 $4C $4C $4F
+.string "6502 ASM"
+
+; .incbin - Include binary file
+.incbin "data.bin"  ; Includes entire file as bytes
+.incbin "sprite.dat"
+```
+
+#### Data Directive Comparison
+```asm
+; Old style (still supported)
+DCB $01 $02 $03     ; Space-separated
+
+; New style (recommended)
+.byte $01,$02,$03   ; Comma-separated
 ```
 
 ### Labels
@@ -95,6 +144,36 @@ start:              ; Define label
 buffer:
     DCB $00 $00
     LDA buffer+1    ; Label arithmetic
+```
+
+### Complete Example
+```asm
+*=$0800
+
+; Constants
+SCREEN = $0400
+CHAR_CODE = 65      ; 'A'
+
+; Data section
+message:
+    .string "HELLO WORLD"
+    
+sprite_data:
+    .byte $00,$3C,$42,$42,$7E,$42,$42,$00
+    
+lookup_table:
+    .word $1000,$2000,$3000,$4000
+
+; Code section
+start:
+    LDX #0
+loop:
+    LDA message,X
+    STA SCREEN,X
+    INX
+    CPX #11
+    BNE loop
+    RTS
 ```
 
 ## Workspace Layout
@@ -172,6 +251,46 @@ fn main() -> Result<(), asm6502::AsmError> {
 }
 ```
 
+### Using New Directives
+
+```rust
+use asm6502::Assembler6502;
+
+fn main() -> Result<(), asm6502::AsmError> {
+    let mut asm = Assembler6502::new();
+    
+    let code = r#"
+        *=$0800
+        
+        ; Define data using modern directives
+        message:
+            .string "HELLO"
+            
+        values:
+            .byte $FF,$FE,$FD,$FC
+            
+        addresses:
+            .word $1000,$2000,$3000
+            
+        ; Use the data
+        start:
+            LDX #0
+        loop:
+            LDA message,X
+            STA $0400,X
+            INX
+            CPX #5
+            BNE loop
+            RTS
+    "#;
+
+    let bytes = asm.assemble_bytes(code)?;
+    println!("Assembled {} bytes", bytes.len());
+    
+    Ok(())
+}
+```
+
 ### Advanced Example with Expressions
 
 ```rust
@@ -217,6 +336,12 @@ fn main() -> Result<(), asm6502::AsmError> {
     
     let code = r#"
         *=$0800
+        
+        data:
+            .byte $01,$02,$03
+            .word $1234
+            .string "HI"
+            
         start:
             LDA #$42
             STA $0200
@@ -262,7 +387,8 @@ The test suite covers:
 4. Mixed number formats
 5. Constants (`LABEL = value`)
 6. Current address usage (`*`)
-7. Complete 6502 program (all addressing modes)
+7. New directives (`.byte`, `.word`, `.string`)
+8. Complete 6502 program (all addressing modes)
 
 ## API Overview
 
@@ -280,13 +406,21 @@ fn assemble_with_symbols(&mut self, src: &str)
 fn assemble_full(&mut self, src: &str) 
     -> Result<(Vec<u8>, Vec<Item>), AsmError>
 
+// Assembly with address mapping
+fn assemble_with_addr_map(&mut self, src: &str)
+    -> Result<(Vec<u8>, Vec<(usize, u16)>), AsmError>
+
 // Configuration
 fn set_origin(&mut self, addr: u16)
+fn origin(&self) -> u16
 fn reset(&mut self)
 
 // Symbol inspection
 fn symbols(&self) -> &HashMap<String, u16>
 fn lookup(&self, name: &str) -> Option<u16>
+
+// Binary output
+fn write_bin<W: Write>(bytes: &[u8], w: W) -> io::Result<()>
 ```
 
 ### Listing Methods (feature-gated)
@@ -298,6 +432,18 @@ fn print_assembly_listing(&self, items: &[Item])
 #[cfg(feature = "listing")]
 fn save_listing(&self, items: &[Item], filename: &str) -> io::Result<()>
 ```
+
+## Directive Reference
+
+| Directive | Syntax | Description | Example |
+|-----------|--------|-------------|---------|
+| `*=` | `*=$0800` | Set origin address | `*=$C000` |
+| `DCB` | `DCB $01 $02` | Define bytes (space-separated) | `DCB $FF $00` |
+| `.byte` | `.byte $01,$02` | Define bytes (comma-separated) | `.byte $01,$02,$03` |
+| `.word` | `.word $1234` | Define 16-bit words (little-endian) | `.word $1000,$2000` |
+| `.string` | `.string "text"` | Define ASCII string | `.string "HELLO"` |
+| `.incbin` | `.incbin "file"` | Include binary file | `.incbin "data.bin"` |
+| `LABEL =` | `CONST = $42` | Define constant | `SCREEN = $0400` |
 
 ## Building & Docs
 
@@ -342,12 +488,33 @@ It intentionally **does not** include:
 
 Constants and expressions are evaluated in-order, requiring definitions before use (except labels which support forward references).
 
-## Notes
+## Technical Notes
 
 - **Forward references:** Labels support forward references, constants do not
 - **Best practice:** Define constants at the top of your source
 - **Expression evaluation:** Left-to-right with standard precedence (`*`, `/` before `+`, `-`)
 - **Branch range:** Automatic long-branch expansion for out-of-range branches
+- **Word endianness:** `.word` directive outputs little-endian (6502 native format)
+- **String encoding:** `.string` uses standard ASCII encoding
+- **Binary inclusion:** `.incbin` reads files relative to working directory
+- **Current address arithmetic:**
+    - `LABEL = *` captures the current program counter
+    - `LABEL = *+n` useful for calculating addresses of upcoming instructions
+    - Example: `RETURN_ADDR = *+1` before a `JSR` captures the return address
+    - Can be used for self-modifying code or address table generation
+
+## Version History
+
+### v2.0 (Current)
+- Added `.byte`, `.word`, `.string`, and `.incbin` directives
+- Improved listing output for data directives
+- Enhanced address mapping support
+
+### v1.0
+- Initial release with core 6502 assembly support
+- Expression evaluation and constants
+- Adaptive long-branch expansion
+- Optional listing feature
 
 ## License
 
