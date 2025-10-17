@@ -604,3 +604,75 @@ test_end:
 
     Ok(())
 }
+
+#[allow(dead_code)]
+fn test_error_reporting() {
+    println!("📝 Error Reporting Examples");
+    println!("{}", "=".repeat(50));
+
+    let mut assembler = Assembler6502::new();
+
+    // Test 1: Undefined label
+    let bad_code1 = r#"
+        *=$0800
+        LDA #$42
+        JMP undefined_label
+    "#;
+
+    match assembler.assemble_bytes(bad_code1) {
+        Err(e) => println!("✓ Undefined label error:\n  {}\n", e),
+        Ok(_) => println!("✗ Should have failed\n"),
+    }
+
+    // Test 2: Invalid immediate value
+    let bad_code2 = r#"
+        *=$0800
+        LDA #$42
+        LDA #$FFFF
+        STA $0200
+    "#;
+
+    match assembler.assemble_bytes(bad_code2) {
+        Err(e) => println!("✓ Invalid immediate value error:\n  {}\n", e),
+        Ok(_) => println!("✗ Should have failed\n"),
+    }
+
+    // Test 3: Invalid syntax
+    let bad_code3 = r#"
+        *=$0800
+        LDA #$42
+        INVALID_MNEMONIC #$42
+        STA $0200
+    "#;
+
+    match assembler.assemble_bytes(bad_code3) {
+        Err(e) => println!("✓ Invalid mnemonic error:\n  {}\n", e),
+        Ok(_) => println!("✗ Should have failed\n"),
+    }
+
+    // Test 4: Undefined constant
+    let bad_code4 = r#"
+        *=$0800
+        LDA #UNDEFINED_CONST
+        STA $0200
+    "#;
+
+    match assembler.assemble_bytes(bad_code4) {
+        Err(e) => println!("✓ Undefined constant error:\n  {}\n", e),
+        Ok(_) => println!("✗ Should have failed\n"),
+    }
+
+    // Test 5: Bad .incbin
+    let bad_code5 = r#"
+        *=$0800
+        .incbin "nonexistent.bin"
+        RTS
+    "#;
+
+    match assembler.assemble_bytes(bad_code5) {
+        Err(e) => println!("✓ File not found error:\n  {}\n", e),
+        Ok(_) => println!("✗ Should have failed\n"),
+    }
+
+    println!("Error reporting test complete\n");
+}

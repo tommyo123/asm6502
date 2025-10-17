@@ -16,22 +16,36 @@ impl<'a> ExpressionEvaluator<'a> {
         }
     }
 
-    /// Evaluate an expression to a u16 value
-    pub fn evaluate(&self, expr: &Expr) -> Result<u16, String> {
+    /// Evaluate an expression to a u32 value
+    /// Returns u32 to handle intermediate calculations like $10000 - offset
+    pub fn evaluate(&self, expr: &Expr) -> Result<u32, String> {
         match expr {
             Expr::Number(n) => Ok(*n),
 
             Expr::Label(name) => {
                 self.symbols
                     .get(name)
+                    .map(|v| v as u32)
                     .ok_or_else(|| format!("Undefined label: {}", name))
             }
 
-            Expr::CurrentAddress => Ok(self.current_address),
+            Expr::CurrentAddress => Ok(self.current_address as u32),
 
             Expr::Immediate(inner) => {
                 // Immediate mode - evaluate the inner expression
                 self.evaluate(inner)
+            }
+
+            Expr::LowByte(inner) => {
+                // Extract low byte (bits 0-7)
+                let value = self.evaluate(inner)?;
+                Ok(value & 0xFF)
+            }
+
+            Expr::HighByte(inner) => {
+                // Extract high byte (bits 8-15)
+                let value = self.evaluate(inner)?;
+                Ok((value >> 8) & 0xFF)
             }
 
             Expr::Add(left, right) => {
@@ -63,9 +77,15 @@ impl<'a> ExpressionEvaluator<'a> {
         }
     }
 
+    /// Evaluate and convert to u16 (with wrapping for values > 0xFFFF)
+    pub fn evaluate_u16(&self, expr: &Expr) -> Result<u16, String> {
+        let value = self.evaluate(expr)?;
+        Ok(value as u16)
+    }
+
     /// Try to evaluate, returning None if labels are undefined (forward reference)
     #[allow(dead_code)]
-    pub fn try_evaluate(&self, expr: &Expr) -> Option<u16> {
+    pub fn try_evaluate(&self, expr: &Expr) -> Option<u32> {
         self.evaluate(expr).ok()
     }
 }
@@ -81,6 +101,7 @@ mod tests {
         let evaluator = ExpressionEvaluator::new(&symbols, 0x1000);
 
         assert_eq!(evaluator.evaluate(&Expr::Number(42)).unwrap(), 42);
+        assert_eq!(evaluator.evaluate(&Expr::Number(0x10000)).unwrap(), 0x10000);
     }
 
     #[test]
@@ -134,5 +155,32 @@ mod tests {
 
         let expr = Expr::Label("UNDEFINED".to_string());
         assert!(evaluator.evaluate(&expr).is_err());
+    }
+
+    #[test]
+    fn test_u32_overflow() {
+        let symbols = SymbolTable::new();
+        let evaluator = ExpressionEvaluator::new(&symbols, 0x1000);
+
+        // $10000 - $100 = $FF00
+        let expr = Expr::Sub(
+            Box::new(Expr::Number(0x10000)),
+            Box::new(Expr::Number(0x100)),
+        );
+
+        assert_eq!(evaluator.evaluate(&expr).unwrap(), 0xFF00);
+        assert_eq!(evaluator.evaluate_u16(&expr).unwrap(), 0xFF00);
+    }
+
+    #[test]
+    fn test_low_high_byte() {
+        let symbols = SymbolTable::new();
+        let evaluator = ExpressionEvaluator::new(&symbols, 0x1000);
+
+        let expr_low = Expr::LowByte(Box::new(Expr::Number(0x1234)));
+        assert_eq!(evaluator.evaluate(&expr_low).unwrap(), 0x34);
+
+        let expr_high = Expr::HighByte(Box::new(Expr::Number(0x1234)));
+        assert_eq!(evaluator.evaluate(&expr_high).unwrap(), 0x12);
     }
 }

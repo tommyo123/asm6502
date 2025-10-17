@@ -26,15 +26,23 @@ pub enum Either<T> {
 /// Parse entire source into a list of Items
 pub fn parse_source(source: &str) -> Result<Vec<Item>, String> {
     let mut instructions = Vec::new();
-    for raw in source.lines() {
+    for (line_num, raw) in source.lines().enumerate() {
         let line = raw.split(';').next().unwrap_or("").trim().to_string();
         if line.is_empty() {
             continue;
         }
-        if let Some(parsed) = parse_line(&line)? {
-            match parsed {
-                Either::Many(list) => instructions.extend(list),
-                Either::One(item) => instructions.push(item),
+        match parse_line(&line) {
+            Ok(Some(parsed)) => {
+                match parsed {
+                    Either::Many(list) => instructions.extend(list),
+                    Either::One(item) => instructions.push(item),
+                }
+            }
+            Ok(None) => {
+                // Empty line or comment only - skip
+            }
+            Err(e) => {
+                return Err(format!("Line {}: {} - {}", line_num + 1, line, e));
             }
         }
     }
@@ -141,17 +149,18 @@ pub fn parse_line(line: &str) -> Result<Option<Either<Item>>, String> {
     }
 
     // Instruction: "LDA #$42" or "NOP"
-    let parts: Vec<&str> = l.split_whitespace().collect();
+    // IMPORTANT: Split on FIRST whitespace only, to allow spaces in operands
+    let parts: Vec<&str> = l.splitn(2, char::is_whitespace).collect();
     match parts.len() {
         1 => Ok(Some(Either::One(Item::Instruction {
             mnemonic: parts[0].to_string(),
             operand: None,
         }))),
         2 => {
-            // Keep operand as string - will be parsed in assembler
+            // Keep operand as string with all spaces intact
             Ok(Some(Either::One(Item::Instruction {
                 mnemonic: parts[0].to_string(),
-                operand: Some(parts[1].to_string()),
+                operand: Some(parts[1].trim().to_string()),
             })))
         }
         _ => Err(format!("Invalid line: {}", l)),

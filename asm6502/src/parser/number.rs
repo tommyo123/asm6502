@@ -12,7 +12,8 @@ pub struct NumberParser;
 
 impl NumberParser {
     /// Parse a number string in any supported format
-    pub fn parse(s: &str) -> Result<u16, String> {
+    /// Returns u32 to support values > 65535 (like $10000)
+    pub fn parse(s: &str) -> Result<u32, String> {
         let trimmed = s.trim();
 
         // Hexadecimal: $FF or 0xFF or 0xFFh
@@ -37,20 +38,20 @@ impl NumberParser {
     }
 
     /// Parse hexadecimal (without prefix)
-    fn parse_hex(s: &str) -> Result<u16, String> {
-        u16::from_str_radix(s, 16)
+    fn parse_hex(s: &str) -> Result<u32, String> {
+        u32::from_str_radix(s, 16)
             .map_err(|_| format!("Invalid hexadecimal: {}", s))
     }
 
     /// Parse binary (without prefix)
-    fn parse_binary(s: &str) -> Result<u16, String> {
-        u16::from_str_radix(s, 2)
+    fn parse_binary(s: &str) -> Result<u32, String> {
+        u32::from_str_radix(s, 2)
             .map_err(|_| format!("Invalid binary: {}", s))
     }
 
     /// Parse decimal
-    fn parse_decimal(s: &str) -> Result<u16, String> {
-        s.parse::<u16>()
+    fn parse_decimal(s: &str) -> Result<u32, String> {
+        s.parse::<u32>()
             .map_err(|_| format!("Invalid decimal: {}", s))
     }
 
@@ -79,6 +80,7 @@ mod tests {
         assert_eq!(NumberParser::parse("0xFF").unwrap(), 255);
         assert_eq!(NumberParser::parse("0xFFh").unwrap(), 255);
         assert_eq!(NumberParser::parse("$1234").unwrap(), 0x1234);
+        assert_eq!(NumberParser::parse("$10000").unwrap(), 0x10000);
     }
 
     #[test]
@@ -93,6 +95,7 @@ mod tests {
         assert_eq!(NumberParser::parse("255").unwrap(), 255);
         assert_eq!(NumberParser::parse("0").unwrap(), 0);
         assert_eq!(NumberParser::parse("65535").unwrap(), 65535);
+        assert_eq!(NumberParser::parse("65536").unwrap(), 65536);
     }
 
     #[test]

@@ -4,10 +4,12 @@ use super::number::NumberParser;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Number(u16),
+    Number(u32),           // Changed to u32 to support $10000
     Label(String),
-    CurrentAddress,  // * symbol
+    CurrentAddress,        // * symbol
     Immediate(Box<Expr>),  // #value - immediate addressing mode
+    LowByte(Box<Expr>),    // <value - extract low byte
+    HighByte(Box<Expr>),   // >value - extract high byte
     Add(Box<Expr>, Box<Expr>),
     Sub(Box<Expr>, Box<Expr>),
     Mul(Box<Expr>, Box<Expr>),
@@ -25,6 +27,18 @@ impl ExpressionParser {
         if let Some(rest) = s.strip_prefix('#') {
             let inner = Self::parse(rest.trim())?;
             return Ok(Expr::Immediate(Box::new(inner)));
+        }
+
+        // Handle low byte operator (<)
+        if let Some(rest) = s.strip_prefix('<') {
+            let inner = Self::parse(rest.trim())?;
+            return Ok(Expr::LowByte(Box::new(inner)));
+        }
+
+        // Handle high byte operator (>)
+        if let Some(rest) = s.strip_prefix('>') {
+            let inner = Self::parse(rest.trim())?;
+            return Ok(Expr::HighByte(Box::new(inner)));
         }
 
         // Check for current address symbol
@@ -179,6 +193,7 @@ mod tests {
         assert_eq!(ExpressionParser::parse("$FF").unwrap(), Expr::Number(255));
         assert_eq!(ExpressionParser::parse("255").unwrap(), Expr::Number(255));
         assert_eq!(ExpressionParser::parse("%11111111").unwrap(), Expr::Number(255));
+        assert_eq!(ExpressionParser::parse("$10000").unwrap(), Expr::Number(0x10000));
     }
 
     #[test]
@@ -243,6 +258,25 @@ mod tests {
                 assert_eq!(*right, Expr::Number(2));
             }
             _ => panic!("Expected Mul expression"),
+        }
+    }
+
+    #[test]
+    fn test_low_high_byte() {
+        let expr = ExpressionParser::parse("<$1234").unwrap();
+        match expr {
+            Expr::LowByte(inner) => {
+                assert_eq!(*inner, Expr::Number(0x1234));
+            }
+            _ => panic!("Expected LowByte"),
+        }
+
+        let expr = ExpressionParser::parse(">$1234").unwrap();
+        match expr {
+            Expr::HighByte(inner) => {
+                assert_eq!(*inner, Expr::Number(0x1234));
+            }
+            _ => panic!("Expected HighByte"),
         }
     }
 }

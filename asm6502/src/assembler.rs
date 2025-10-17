@@ -103,7 +103,7 @@ impl Assembler6502 {
                 Item::Data(exprs) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, pc);
                     for expr in exprs {
-                        eval.evaluate(expr).map_err(AsmError::Asm)?;
+                        eval.evaluate_u16(expr).map_err(AsmError::Asm)?;
                         map.push((idx, pc));
                         idx += 1;
                         pc = pc.wrapping_add(1);
@@ -112,7 +112,7 @@ impl Assembler6502 {
                 Item::Words(exprs) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, pc);
                     for expr in exprs {
-                        eval.evaluate(expr).map_err(AsmError::Asm)?;
+                        eval.evaluate_u16(expr).map_err(AsmError::Asm)?;
                         map.push((idx, pc));
                         idx += 1;
                         pc = pc.wrapping_add(1);
@@ -139,7 +139,7 @@ impl Assembler6502 {
                 }
                 Item::Org(expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, pc);
-                    pc = eval.evaluate(expr).map_err(AsmError::Asm)?;
+                    pc = eval.evaluate_u16(expr).map_err(AsmError::Asm)?;
                 }
                 Item::Label(_) | Item::Constant(_, _) => {}
             }
@@ -174,6 +174,7 @@ impl Assembler6502 {
 
         // Adaptive pass limit based on branch count
         let mut guard = self.count_branches(&instructions) + 2;
+        let mut iteration = 0;
         loop {
             self.symbols.clear();
             let (fixed, modified) = self.fix_long_branches(&instructions);
@@ -181,8 +182,49 @@ impl Assembler6502 {
             if !modified {
                 break;
             }
+            iteration += 1;
             if guard == 0 {
-                return Err("Long-branch fix didn't converge".to_string());
+                // Collect information about problematic branches
+                let mut problematic_branches = Vec::new();
+                let mut current_address = self.start_address;
+
+                for inst in instructions.iter() {
+                    if let Item::Instruction { mnemonic, operand } = inst {
+                        if is_branch(mnemonic.as_str()) {
+                            if let Some(target) = operand {
+                                if let Some(target_addr) = self.symbols.get(target) {
+                                    let offset = target_addr as i32 - (current_address as i32 + 2);
+                                    if offset < -128 || offset > 127 {
+                                        problematic_branches.push(format!(
+                                            "${:04X}: {} {} (offset: {}, target: ${:04X})",
+                                            current_address, mnemonic, target, offset, target_addr
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        if let Ok(size) = self.instruction_size(inst, current_address) {
+                            current_address = current_address.wrapping_add(size as u16);
+                        }
+                    } else if !matches!(inst, Item::Label(_)) {
+                        if let Ok(size) = self.instruction_size(inst, current_address) {
+                            current_address = current_address.wrapping_add(size as u16);
+                        }
+                    }
+                }
+
+                if problematic_branches.is_empty() {
+                    return Err(format!(
+                        "Long-branch fix didn't converge after {} iterations (no obvious problematic branches found)",
+                        iteration
+                    ));
+                } else {
+                    return Err(format!(
+                        "Long-branch fix didn't converge after {} iterations. Problematic branches:\n  {}",
+                        iteration,
+                        problematic_branches.join("\n  ")
+                    ));
+                }
             }
             guard -= 1;
         }
@@ -200,12 +242,14 @@ impl Assembler6502 {
                 Item::Constant(name, expr) => {
                     // Evaluate constant and add to symbol table
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                    let value = eval.evaluate(expr)?;
+                    let value = eval.evaluate_u16(expr)
+                        .map_err(|e| format!("Constant '{}': {}", name, e))?;
                     self.symbols.insert(name.clone(), value);
                 }
                 Item::Org(expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                    current_address = eval.evaluate(expr)?;
+                    current_address = eval.evaluate_u16(expr)
+                        .map_err(|e| format!("ORG directive: {}", e))?;
                 }
                 _ => {
                     current_address =
@@ -222,12 +266,14 @@ impl Assembler6502 {
                 Item::Constant(_, _) => {}  // Constants don't emit bytes
                 Item::Org(expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                    current_address = eval.evaluate(expr)?;
+                    current_address = eval.evaluate_u16(expr)
+                        .map_err(|e| format!("ORG directive: {}", e))?;
                 }
                 Item::Data(exprs) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
                     for expr in exprs {
-                        let val = eval.evaluate(expr)?;
+                        let val = eval.evaluate_u16(expr)
+                            .map_err(|e| format!(".byte directive at ${:04X}: {}", current_address, e))?;
                         machine.push((val & 0xFF) as u8);
                         current_address = current_address.wrapping_add(1);
                     }
@@ -235,7 +281,8 @@ impl Assembler6502 {
                 Item::Words(exprs) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
                     for expr in exprs {
-                        let val = eval.evaluate(expr)?;
+                        let val = eval.evaluate_u16(expr)
+                            .map_err(|e| format!(".word directive at ${:04X}: {}", current_address, e))?;
                         // Little-endian: low byte first, then high byte
                         machine.push((val & 0xFF) as u8);
                         machine.push((val >> 8) as u8);
@@ -250,15 +297,18 @@ impl Assembler6502 {
                 }
                 Item::IncBin(filename) => {
                     let bytes = fs::read(filename)
-                        .map_err(|e| format!("Failed to read {}: {}", filename, e))?;
+                        .map_err(|e| format!(".incbin \"{}\" at ${:04X}: {}", filename, current_address, e))?;
                     for byte in bytes {
                         machine.push(byte);
                         current_address = current_address.wrapping_add(1);
                     }
                 }
                 Item::Instruction { mnemonic, operand } => {
-                    let bytes =
-                        self.assemble_instruction(mnemonic, operand.as_deref(), current_address)?;
+                    let bytes = self.assemble_instruction(mnemonic, operand.as_deref(), current_address)
+                        .map_err(|e| {
+                            let op_str = operand.as_ref().map(|s| format!(" {}", s)).unwrap_or_default();
+                            format!("${:04X}: {}{} - {}", current_address, mnemonic, op_str, e)
+                        })?;
                     current_address = current_address.wrapping_add(bytes.len() as u16);
                     machine.extend_from_slice(&bytes);
                 }
@@ -302,7 +352,7 @@ impl Assembler6502 {
         if let Some(rest) = operand.strip_prefix('#') {
             let expr = ExpressionParser::parse(rest)?;
             let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-            let value = eval.evaluate(&expr)?;
+            let value = eval.evaluate_u16(&expr)?;
             if value > 0xFF {
                 return Err(format!("Immediate value too large: ${:04X}", value));
             }
@@ -335,19 +385,19 @@ impl Assembler6502 {
             let inner = &operand[1..operand.len() - 1];
             let expr = ExpressionParser::parse(inner)?;
             let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-            let value = eval.evaluate(&expr)?;
+            let value = eval.evaluate_u16(&expr)?;
             return Ok(vec![0x6C, (value & 0xFF) as u8, (value >> 8) as u8]);
         }
         let expr = ExpressionParser::parse(operand)?;
         let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-        let value = eval.evaluate(&expr)?;
+        let value = eval.evaluate_u16(&expr)?;
         Ok(vec![0x4C, (value & 0xFF) as u8, (value >> 8) as u8])
     }
 
     fn handle_subroutine(&self, operand: &str, current_address: u16) -> Result<Vec<u8>, String> {
         let expr = ExpressionParser::parse(operand)?;
         let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-        let value = eval.evaluate(&expr)?;
+        let value = eval.evaluate_u16(&expr)?;
         Ok(vec![0x20, (value & 0xFF) as u8, (value >> 8) as u8])
     }
 
@@ -382,7 +432,7 @@ impl Assembler6502 {
                 .trim();
             let expr = ExpressionParser::parse(inner)?;
             let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-            let val = eval.evaluate(&expr)?;
+            let val = eval.evaluate_u16(&expr)?;
             let code = self
                 .opcodes
                 .extended_opcodes
@@ -400,7 +450,7 @@ impl Assembler6502 {
             if idx.eq_ignore_ascii_case("X") {
                 let expr = ExpressionParser::parse(a)?;
                 let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                let val = eval.evaluate(&expr)?;
+                let val = eval.evaluate_u16(&expr)?;
                 let code = self
                     .opcodes
                     .extended_opcodes
@@ -423,7 +473,7 @@ impl Assembler6502 {
     ) -> Result<Vec<u8>, String> {
         let expr = ExpressionParser::parse(addr_part)?;
         let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-        let val = eval.evaluate(&expr)?;
+        let val = eval.evaluate_u16(&expr)?;
         let force_zp = mode_override == AddrOverride::ForceZp;
         let force_abs = mode_override == AddrOverride::ForceAbs;
         let is_zp = val < 0x100;
@@ -459,7 +509,7 @@ impl Assembler6502 {
     ) -> Result<Vec<u8>, String> {
         let expr = ExpressionParser::parse(operand)?;
         let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-        let val = eval.evaluate(&expr)?;
+        let val = eval.evaluate_u16(&expr)?;
         let force_zp = mode_override == AddrOverride::ForceZp;
         let force_abs = mode_override == AddrOverride::ForceAbs;
 
@@ -532,8 +582,10 @@ impl Assembler6502 {
     }
 
     pub fn fix_long_branches(&mut self, instructions: &[Item]) -> (Vec<Item>, bool) {
-        // First pass: collect label addresses
+        // CRITICAL: Build symbol table FIRST so we know where all labels are
+        self.symbols.clear();
         let mut current_address = self.start_address;
+
         for inst in instructions.iter() {
             match inst {
                 Item::Label(name) => {
@@ -541,13 +593,13 @@ impl Assembler6502 {
                 }
                 Item::Constant(name, expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                    if let Ok(value) = eval.evaluate(expr) {
+                    if let Ok(value) = eval.evaluate_u16(expr) {
                         self.symbols.insert(name.clone(), value);
                     }
                 }
                 Item::Org(expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                    if let Ok(addr) = eval.evaluate(expr) {
+                    if let Ok(addr) = eval.evaluate_u16(expr) {
                         current_address = addr;
                     }
                 }
@@ -559,13 +611,36 @@ impl Assembler6502 {
             }
         }
 
-        // Second pass: expand long branches
+        // Now expand branches using the computed symbol table
         let mut fixed: Vec<Item> = Vec::new();
         current_address = self.start_address;
         let mut modified = false;
         let mut unique_counter = 0u32;
 
         for inst in instructions.iter() {
+            // Handle ORG first
+            if let Item::Org(expr) = inst {
+                fixed.push(inst.clone());
+                let eval = ExpressionEvaluator::new(&self.symbols, current_address);
+                if let Ok(addr) = eval.evaluate_u16(expr) {
+                    current_address = addr;
+                }
+                continue;
+            }
+
+            // Handle labels - they don't advance address
+            if let Item::Label(_) = inst {
+                fixed.push(inst.clone());
+                continue;
+            }
+
+            // Handle constants - they don't advance address
+            if let Item::Constant(_, _) = inst {
+                fixed.push(inst.clone());
+                continue;
+            }
+
+            // Check for branch expansion
             if let Item::Instruction { mnemonic, operand } = inst {
                 if is_branch(mnemonic.as_str()) {
                     if let Some(op) = operand {
@@ -573,30 +648,39 @@ impl Assembler6502 {
                             let (_, in_range) =
                                 self.calculate_branch_distance(current_address, target_addr);
                             if !in_range {
+                                // Expand: BXX label -> BXX skip; JMP label; skip:
                                 let skip_label = format!("__skip_{}", unique_counter);
                                 unique_counter += 1;
+
+                                // BXX __skip (2 bytes at current_address)
                                 fixed.push(Item::Instruction {
                                     mnemonic: mnemonic.clone(),
                                     operand: Some(skip_label.clone()),
                                 });
+                                current_address = current_address.wrapping_add(2);
+
+                                // JMP label (3 bytes)
                                 fixed.push(Item::Instruction {
                                     mnemonic: "JMP".to_string(),
                                     operand: Some(op.clone()),
                                 });
+                                current_address = current_address.wrapping_add(3);
+
+                                // __skip: label (0 bytes - just marks position)
                                 fixed.push(Item::Label(skip_label));
+
                                 modified = true;
-                                current_address = current_address.wrapping_add(5);
                                 continue;
                             }
                         }
                     }
                 }
             }
+
+            // Add instruction as-is and advance address
             fixed.push(inst.clone());
-            if !matches!(inst, Item::Label(_)) {
-                if let Ok(size) = self.instruction_size(inst, current_address) {
-                    current_address = current_address.wrapping_add(size as u16);
-                }
+            if let Ok(size) = self.instruction_size(inst, current_address) {
+                current_address = current_address.wrapping_add(size as u16);
             }
         }
 
@@ -623,7 +707,7 @@ impl Assembler6502 {
                 }
                 Item::Constant(name, expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                    if let Ok(value) = eval.evaluate(expr) {
+                    if let Ok(value) = eval.evaluate_u16(expr) {
                         println!("              {} = ${:04X}", name, value);
                     }
                 }
@@ -648,7 +732,7 @@ impl Assembler6502 {
                 }
                 Item::Org(expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                    if let Ok(addr) = eval.evaluate(expr) {
+                    if let Ok(addr) = eval.evaluate_u16(expr) {
                         println!("${:04X}:          *=${:04X}", current_address, addr);
                         current_address = addr;
                     }
@@ -656,7 +740,7 @@ impl Assembler6502 {
                 Item::Data(exprs) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
                     let bytes: Vec<u8> = exprs.iter()
-                        .filter_map(|e| eval.evaluate(e).ok())
+                        .filter_map(|e| eval.evaluate_u16(e).ok())
                         .map(|v| (v & 0xFF) as u8)
                         .collect();
                     let hex_data = bytes
@@ -674,7 +758,7 @@ impl Assembler6502 {
                 Item::Words(exprs) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
                     let words: Vec<u16> = exprs.iter()
-                        .filter_map(|e| eval.evaluate(e).ok())
+                        .filter_map(|e| eval.evaluate_u16(e).ok())
                         .collect();
                     let bytes: Vec<u8> = words.iter()
                         .flat_map(|&w| vec![(w & 0xFF) as u8, (w >> 8) as u8])
@@ -751,7 +835,7 @@ impl Assembler6502 {
                 }
                 Item::Constant(name, expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                    if let Ok(value) = eval.evaluate(expr) {
+                    if let Ok(value) = eval.evaluate_u16(expr) {
                         writeln!(f, "              {} = ${:04X}", name, value)?;
                     }
                 }
@@ -777,7 +861,7 @@ impl Assembler6502 {
                 }
                 Item::Org(expr) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
-                    if let Ok(addr) = eval.evaluate(expr) {
+                    if let Ok(addr) = eval.evaluate_u16(expr) {
                         writeln!(f, "${:04X}:          *=${:04X}", current_address, addr)?;
                         current_address = addr;
                     }
@@ -785,7 +869,7 @@ impl Assembler6502 {
                 Item::Data(exprs) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
                     let bytes: Vec<u8> = exprs.iter()
-                        .filter_map(|e| eval.evaluate(e).ok())
+                        .filter_map(|e| eval.evaluate_u16(e).ok())
                         .map(|v| (v & 0xFF) as u8)
                         .collect();
                     let hex_data = bytes
@@ -800,7 +884,7 @@ impl Assembler6502 {
                 Item::Words(exprs) => {
                     let eval = ExpressionEvaluator::new(&self.symbols, current_address);
                     let words: Vec<u16> = exprs.iter()
-                        .filter_map(|e| eval.evaluate(e).ok())
+                        .filter_map(|e| eval.evaluate_u16(e).ok())
                         .collect();
                     let bytes: Vec<u8> = words.iter()
                         .flat_map(|&w| vec![(w & 0xFF) as u8, (w >> 8) as u8])
