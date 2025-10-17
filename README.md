@@ -8,6 +8,7 @@ A minimal 6502 assembler written in Rust for inline assembly and lightweight com
     * Hexadecimal: `$FF`, `0xFF`, `0xFFh`
     * Binary: `%11111111`, `0b11111111`
     * Decimal: `255`
+    * Extended range: Values up to 4,294,967,295 (u32) for calculations
 * **Expression arithmetic:**
     * Addition: `$10+5`, `LABEL+1`
     * Subtraction: `$FF-10`, `*-2`
@@ -15,10 +16,16 @@ A minimal 6502 assembler written in Rust for inline assembly and lightweight com
     * Division: `100/5`
     * Mixed formats: `$10+10+%00000101`
     * Operator precedence: `*,/` before `+,-`
+    * Parentheses: `($10000-$100)`
+* **Low/High byte extraction:**
+    * `<expr` - Extract low byte (bits 0-7)
+    * `>expr` - Extract high byte (bits 8-15)
+    * Works with any expression: `#<($10000-RAM_SIZE)`
 * **Constants:** Define reusable values with `LABEL = value` syntax
     * Simple: `SCREEN = $0400`
     * Expressions: `OFFSET = BASE+$10`
     * Current address: `HERE = *`, `NEXT = *+1`
+    * Memory calculations: `TOP_MEM = $10000-$100`
 * **Modern directives:**
     * `.byte` - Comma-separated bytes
     * `.word` - 16-bit words (little-endian)
@@ -32,6 +39,7 @@ A minimal 6502 assembler written in Rust for inline assembly and lightweight com
         * `<$80` → force Zero Page addressing
         * `>$80` → force Absolute addressing
 * **Adaptive long-branch expansion:** Out-of-range branches automatically become `BRANCH skip` + `JMP target`
+* **Whitespace-friendly:** Spaces allowed in operands: `LDA #<($10000 - $100)`
 * **Optional listing output:** Print to stdout and/or save to file (feature-gated)
 * **Symbol table & address mapping helpers**
 
@@ -44,6 +52,35 @@ LDA #255            ; Decimal
 LDA #%11111111      ; Binary
 LDA #0xFF           ; Alternative hex format
 LDA #0b11111111     ; Alternative binary format
+LDA #$10000         ; Extended range for calculations (65536)
+```
+
+### Low/High Byte Operators
+```asm
+; Extract low byte (<)
+    LDA #<$1234         ; Low byte = $34
+    LDA #<SCREEN        ; Low byte of address
+    
+; Extract high byte (>)
+    LDA #>$1234         ; High byte = $12
+    LDA #>SCREEN        ; High byte of address
+    
+; Common pattern: Load 16-bit address
+BUFFER = $2000
+    LDA #<BUFFER        ; Low byte
+    STA $FC
+    LDA #>BUFFER        ; High byte
+    STA $FD
+    
+; With expressions (note: no spaces in operands for best compatibility)
+    LDA #<($10000-$100) ; Low byte of $FF00 = $00
+    LDX #>($10000-$100) ; High byte of $FF00 = $FF
+    
+; Real-world memory calculations
+RAM_SIZE = $0200
+TOP_ADDR = $10000-RAM_SIZE  ; = $FE00
+    LDA #<TOP_ADDR      ; $00
+    LDX #>TOP_ADDR      ; $FE
 ```
 
 ### Expressions
@@ -54,9 +91,14 @@ LDA #10*2           ; = 20
 LDA #100/5          ; = 20
 LDA #$FF-10         ; = $F5
 
-; Complex expressions
+; Complex expressions (spaces allowed in operands)
 LDA #10*2+5         ; = 25 (precedence: * before +)
+LDA #($FF - $10)    ; = $EF (parentheses supported)
 LDA #$10+10+%00000101  ; Mixed formats = $1F
+
+; Extended range calculations
+LDA #<($10000 - RAM_SIZE)  ; Top-of-memory calculations
+LDX #>($10000 - $500 + $100) ; Complex address math
 
 ; With labels
 LDA buffer+1        ; Address of buffer + 1
@@ -74,6 +116,16 @@ MAX_LIVES = 3
 BASE = $1000
 OFFSET = BASE+$10   ; = $1010
 DOUBLE = SPRITE_X*2 ; = 200
+
+; Low/High byte constants
+SCREEN_LO = <SCREEN ; = $00
+SCREEN_HI = >SCREEN ; = $04
+
+; Memory calculations
+RAM_SIZE = $0200
+TOP_MEM = $10000-RAM_SIZE ; = $FE00 (top of memory minus size)
+RAM_LO = <TOP_MEM   ; = $00
+RAM_HI = >TOP_MEM   ; = $FE
 
 ; Current address (*) constants
 HERE = *            ; Current program counter
@@ -146,33 +198,47 @@ buffer:
     LDA buffer+1    ; Label arithmetic
 ```
 
-### Complete Example
+### Complete Example with Memory Calculations
 ```asm
-*=$0800
+*=$0801
 
-; Constants
-SCREEN = $0400
-CHAR_CODE = 65      ; 'A'
+; BASIC stub: SYS 2061
+.byte $0B,$08,$0A,$00,$9E,$32,$30,$36,$31,$00,$00,$00
 
-; Data section
-message:
-    .string "HELLO WORLD"
-    
-sprite_data:
-    .byte $00,$3C,$42,$42,$7E,$42,$42,$00
-    
-lookup_table:
-    .word $1000,$2000,$3000,$4000
+; Zero page pointers
+LZSA_SRC = $FC      ; Source pointer (2 bytes)
+LZSA_DST = $FE      ; Destination pointer (2 bytes)
 
-; Code section
+; Calculate sizes
+RAM_DATA_SIZE = $0150
+RELOCATED_SIZE = $00BD
+
+; Top-of-memory calculations
+TOP_MEM = $10000
+RAM_BLOCK = TOP_MEM - RAM_DATA_SIZE ; = $FEB0
+RELOC_ADDR = RAM_BLOCK + RELOCATED_SIZE ; = $FF6D
+
 start:
-    LDX #0
-loop:
-    LDA message,X
-    STA SCREEN,X
-    INX
-    CPX #11
-    BNE loop
+    ; Load source address (little-endian)
+    LDA #<data_block
+    STA LZSA_SRC
+    LDA #>data_block
+    STA LZSA_SRC+1
+    
+    ; Load destination at top of memory
+    LDA #<RAM_BLOCK
+    STA LZSA_DST
+    LDA #>RAM_BLOCK
+    STA LZSA_DST+1
+    
+    JSR decompress
+    RTS
+
+data_block:
+    .incbin "compressed.lzsa"
+    
+decompress:
+    ; Decompression routine here...
     RTS
 ```
 
@@ -251,6 +317,43 @@ fn main() -> Result<(), asm6502::AsmError> {
 }
 ```
 
+### Using Low/High Byte Operators
+
+```rust
+use asm6502::Assembler6502;
+
+fn main() -> Result<(), asm6502::AsmError> {
+    let mut asm = Assembler6502::new();
+    
+    let code = r#"
+        *=$0800
+        
+        ; Define 16-bit address
+        SCREEN = $D800
+        
+        ; Load address using low/high byte extraction
+        load_address:
+            LDA #<SCREEN    ; Low byte = $00
+            STA $FB
+            LDA #>SCREEN    ; High byte = $D8
+            STA $FC
+            
+        ; Top-of-memory calculations
+        RAM_SIZE = $0200
+        TOP_ADDR = $10000-RAM_SIZE  ; = $FE00
+        
+            LDA #<TOP_ADDR  ; = $00
+            LDX #>TOP_ADDR  ; = $FE
+            RTS
+    "#;
+
+    let bytes = asm.assemble_bytes(code)?;
+    println!("Assembled {} bytes", bytes.len());
+    
+    Ok(())
+}
+```
+
 ### Using New Directives
 
 ```rust
@@ -301,16 +404,23 @@ fn main() -> Result<(), asm6502::AsmError> {
     asm.set_origin(0x1000);
     
     let code = r#"
-        ; Constants
+        ; Constants with u32 calculations
         BASE = $2000
         OFFSET = BASE+$100
         COUNT = 10*2
+        
+        ; Top-of-memory calculations
+        RAM_SIZE = $0500
+        TOP_MEM = $10000-RAM_SIZE  ; = $FB00
         
         ; Code with expressions
         start:
             LDA #COUNT
             STA BASE
-            LDA OFFSET+5
+            LDA #<TOP_MEM
+            STA $FC
+            LDA #>TOP_MEM
+            STA $FD
             JMP start
     "#;
 
@@ -388,7 +498,9 @@ The test suite covers:
 5. Constants (`LABEL = value`)
 6. Current address usage (`*`)
 7. New directives (`.byte`, `.word`, `.string`)
-8. Complete 6502 program (all addressing modes)
+8. U32 support and memory calculations
+9. Low/high byte operators
+10. Complete 6502 program (all addressing modes)
 
 ## API Overview
 
@@ -445,6 +557,19 @@ fn save_listing(&self, items: &[Item], filename: &str) -> io::Result<()>
 | `.incbin` | `.incbin "file"` | Include binary file | `.incbin "data.bin"` |
 | `LABEL =` | `CONST = $42` | Define constant | `SCREEN = $0400` |
 
+## Operator Reference
+
+| Operator | Description | Example | Result |
+|----------|-------------|---------|--------|
+| `+` | Addition | `$10+5` | `$15` |
+| `-` | Subtraction | `$FF-10` | `$F5` |
+| `*` | Multiplication | `10*2` | `20` |
+| `/` | Division | `100/5` | `20` |
+| `<` | Low byte (bits 0-7) | `<$1234` | `$34` |
+| `>` | High byte (bits 8-15) | `>$1234` | `$12` |
+| `*` | Current address | `LABEL=*` | Current PC |
+| `()` | Grouping | `($10+$20)*2` | `$60` |
+
 ## Building & Docs
 
 Build the workspace:
@@ -478,6 +603,7 @@ This assembler is designed for:
 - **JIT compilation**: Runtime generation of 6502 code
 - **Emulator testing**: Dynamic test case generation
 - **Educational tools**: Interactive 6502 learning
+- **Real-world 6502 projects**: With extended u32 support for memory calculations
 - **Simplicity**: Minimal dependencies, clear code structure
 
 It intentionally **does not** include:
@@ -497,6 +623,9 @@ Constants and expressions are evaluated in-order, requiring definitions before u
 - **Word endianness:** `.word` directive outputs little-endian (6502 native format)
 - **String encoding:** `.string` uses standard ASCII encoding
 - **Binary inclusion:** `.incbin` reads files relative to working directory
+- **U32 support:** Internal calculations use 32-bit unsigned integers, automatically wrapping to 16-bit for addresses
+- **Memory calculations:** Supports expressions like `$10000-RAM_SIZE` for top-of-memory calculations
+- **Whitespace in operands:** Spaces are allowed in operands (split on first whitespace only)
 - **Current address arithmetic:**
     - `LABEL = *` captures the current program counter
     - `LABEL = *+n` useful for calculating addresses of upcoming instructions
@@ -505,7 +634,14 @@ Constants and expressions are evaluated in-order, requiring definitions before u
 
 ## Version History
 
-### v2.0 (Current)
+### v2.1 (Current)
+- Added u32 expression support for values > 65535 (e.g., `$10000`)
+- Added low/high byte operators (`<` and `>`)
+- Improved lexer to allow whitespace in operands
+- Enhanced long branch expansion algorithm
+- Better support for real-world memory calculations
+
+### v2.0
 - Added `.byte`, `.word`, `.string`, and `.incbin` directives
 - Improved listing output for data directives
 - Enhanced address mapping support
