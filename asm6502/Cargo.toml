@@ -1,11 +1,11 @@
 [package]
 name = "asm6502"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 
 [lib]
 name = "asm6502"
-path = "src/lib.rs"    # <-- RETT PATH!
+path = "src/lib.rs"
 
 [features]
 default = []

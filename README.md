@@ -634,7 +634,12 @@ Constants and expressions are evaluated in-order, requiring definitions before u
 
 ## Version History
 
-### v2.1 (Current)
+### v2.2 (Current)
+- Fixed long branch expansion: branch condition is now correctly inverted in the `BXX -> BYY skip; JMP far; skip:` rewrite
+- Fixed `__skip_<n>` label collisions across fix-up iterations by promoting the counter to per-assembler state
+- Both bugs could produce incorrect machine code or non-converging fix-up loops on programs large enough to need a long-branch expansion
+
+### v2.1
 - Added u32 expression support for values > 65535 (e.g., `$10000`)
 - Added low/high byte operators (`<` and `>`)
 - Improved lexer to allow whitespace in operands
