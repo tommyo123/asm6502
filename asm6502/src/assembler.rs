@@ -11,7 +11,7 @@ use crate::error::AsmError;
 use crate::opcodes::OpcodeTables;
 use crate::symbol::SymbolTable;
 use crate::parser::{parse_source, parse_line, Either, ExpressionParser};
-use crate::addressing::{parse_addr_override, is_branch, AddrOverride};
+use crate::addressing::{invert_branch, parse_addr_override, is_branch, AddrOverride};
 use crate::eval::ExpressionEvaluator;
 
 // Re-export Item for public API
@@ -21,6 +21,7 @@ pub struct Assembler6502 {
     opcodes: OpcodeTables,
     symbols: SymbolTable,
     start_address: u16,
+    skip_label_counter: u32,
 }
 
 impl Default for Assembler6502 {
@@ -35,6 +36,7 @@ impl Assembler6502 {
             opcodes: OpcodeTables::new(),
             symbols: SymbolTable::new(),
             start_address: 0x0080,
+            skip_label_counter: 0,
         }
     }
 
@@ -154,6 +156,7 @@ impl Assembler6502 {
     pub fn reset(&mut self) {
         self.symbols.clear();
         self.start_address = 0x0080;
+        self.skip_label_counter = 0;
     }
 
     // ===== Parsing =====
@@ -171,6 +174,7 @@ impl Assembler6502 {
 
     fn assemble(&mut self, code: &str) -> Result<(Vec<u8>, Vec<Item>), String> {
         let mut instructions = self.parse_source(code)?;
+        self.skip_label_counter = 0;
 
         // Adaptive pass limit based on branch count
         let mut guard = self.count_branches(&instructions) + 2;
@@ -615,7 +619,6 @@ impl Assembler6502 {
         let mut fixed: Vec<Item> = Vec::new();
         current_address = self.start_address;
         let mut modified = false;
-        let mut unique_counter = 0u32;
 
         for inst in instructions.iter() {
             // Handle ORG first
@@ -648,13 +651,22 @@ impl Assembler6502 {
                             let (_, in_range) =
                                 self.calculate_branch_distance(current_address, target_addr);
                             if !in_range {
-                                // Expand: BXX label -> BXX skip; JMP label; skip:
-                                let skip_label = format!("__skip_{}", unique_counter);
-                                unique_counter += 1;
+                                // Expand `BXX far_label` to:
+                                //   BYY skip      ; YY = inverted condition
+                                //   JMP far_label
+                                //   skip:
+                                // The branch must be INVERTED so that
+                                // when the original BXX would have been
+                                // taken (jump to far_label), control
+                                // falls through into the JMP.
+                                let inverted = invert_branch(mnemonic.as_str())
+                                    .expect("is_branch implies invertible");
+                                let skip_label = format!("__skip_{}", self.skip_label_counter);
+                                self.skip_label_counter += 1;
 
-                                // BXX __skip (2 bytes at current_address)
+                                // BYY __skip (2 bytes at current_address)
                                 fixed.push(Item::Instruction {
-                                    mnemonic: mnemonic.clone(),
+                                    mnemonic: inverted.to_string(),
                                     operand: Some(skip_label.clone()),
                                 });
                                 current_address = current_address.wrapping_add(2);

@@ -25,3 +25,20 @@ pub fn is_branch(mnemonic: &str) -> bool {
         "BCC" | "BCS" | "BEQ" | "BMI" | "BNE" | "BPL" | "BVC" | "BVS"
     )
 }
+
+/// The branch with the opposite condition. Used by the long-branch
+/// expander: a `BXX far_label` becomes `BYY skip; JMP far_label; skip:`
+/// where YY inverts XX so the jump fires under the original condition.
+pub fn invert_branch(mnemonic: &str) -> Option<&'static str> {
+    Some(match mnemonic {
+        "BCC" => "BCS",
+        "BCS" => "BCC",
+        "BEQ" => "BNE",
+        "BNE" => "BEQ",
+        "BMI" => "BPL",
+        "BPL" => "BMI",
+        "BVC" => "BVS",
+        "BVS" => "BVC",
+        _ => return None,
+    })
+}
