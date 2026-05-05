@@ -13,6 +13,7 @@ use crate::symbol::SymbolTable;
 use crate::parser::{parse_source, parse_line, Either, ExpressionParser};
 use crate::addressing::{invert_branch, parse_addr_override, is_branch, AddrOverride};
 use crate::eval::ExpressionEvaluator;
+use crate::reserved::ReservedRange;
 
 // Re-export Item for public API
 pub use crate::parser::lexer::Item;
@@ -22,6 +23,7 @@ pub struct Assembler6502 {
     symbols: SymbolTable,
     start_address: u16,
     skip_label_counter: u32,
+    reserved_ranges: Vec<ReservedRange>,
 }
 
 impl Default for Assembler6502 {
@@ -37,6 +39,7 @@ impl Assembler6502 {
             symbols: SymbolTable::new(),
             start_address: 0x0080,
             skip_label_counter: 0,
+            reserved_ranges: Vec::new(),
         }
     }
 
@@ -143,6 +146,13 @@ impl Assembler6502 {
                     let eval = ExpressionEvaluator::new(&self.symbols, pc);
                     pc = eval.evaluate_u16(expr).map_err(AsmError::Asm)?;
                 }
+                Item::Pad(n) => {
+                    for _ in 0..*n {
+                        map.push((idx, pc));
+                        idx += 1;
+                        pc = pc.wrapping_add(1);
+                    }
+                }
                 Item::Label(_) | Item::Constant(_, _) => {}
             }
         }
@@ -157,6 +167,54 @@ impl Assembler6502 {
         self.symbols.clear();
         self.start_address = 0x0080;
         self.skip_label_counter = 0;
+    }
+
+    // ===== Reserved memory ranges =====
+
+    /// Mark `[start, end]` (inclusive) as reserved. The assembler will
+    /// emit a `JMP <end+1>` plus `$00`-fill instead of placing code there.
+    /// Returns an error if the range is malformed, overlaps an existing
+    /// reserved range, or sits closer than 3 bytes (the JMP size) to one.
+    pub fn add_reserved_range(&mut self, start: u16, end: u16) -> Result<(), AsmError> {
+        if start > end {
+            return Err(AsmError::Asm(format!(
+                "Invalid reserved range: ${:04X}-${:04X} (start > end)",
+                start, end
+            )));
+        }
+        if end == 0xFFFF {
+            return Err(AsmError::Asm(format!(
+                "Reserved range ${:04X}-${:04X} extends to end of address space; nothing to JMP to",
+                start, end
+            )));
+        }
+        for r in &self.reserved_ranges {
+            if start <= r.end && end >= r.start {
+                return Err(AsmError::Asm(format!(
+                    "Reserved range ${:04X}-${:04X} overlaps existing ${:04X}-${:04X}",
+                    start, end, r.start, r.end
+                )));
+            }
+            let (lo, hi) = if start < r.start { (end, r.start) } else { (r.end, start) };
+            let gap = hi as i32 - lo as i32 - 1;
+            if gap < 3 {
+                return Err(AsmError::Asm(format!(
+                    "Reserved range ${:04X}-${:04X} sits {} bytes from ${:04X}-${:04X}; need >= 3 bytes between ranges for the JMP",
+                    start, end, gap, r.start, r.end
+                )));
+            }
+        }
+        self.reserved_ranges.push(ReservedRange { start, end });
+        self.reserved_ranges.sort_by_key(|r| r.start);
+        Ok(())
+    }
+
+    pub fn clear_reserved_ranges(&mut self) {
+        self.reserved_ranges.clear();
+    }
+
+    pub fn reserved_ranges(&self) -> &[ReservedRange] {
+        &self.reserved_ranges
     }
 
     // ===== Parsing =====
@@ -176,14 +234,20 @@ impl Assembler6502 {
         let mut instructions = self.parse_source(code)?;
         self.skip_label_counter = 0;
 
-        // Adaptive pass limit based on branch count
-        let mut guard = self.count_branches(&instructions) + 2;
+        // Adaptive pass limit. Both reserved-range insertion and long-branch
+        // expansion only ever ADD items, so convergence is guaranteed; the
+        // bound just covers worst-case interleaving.
+        let mut guard = self.count_branches(&instructions) + self.reserved_ranges.len() + 4;
         let mut iteration = 0;
         loop {
+            let (after_reserved, mod_reserved) = self.apply_reserved_ranges(&instructions)?;
+            instructions = after_reserved;
+
             self.symbols.clear();
-            let (fixed, modified) = self.fix_long_branches(&instructions);
+            let (fixed, mod_branch) = self.fix_long_branches(&instructions);
             instructions = fixed;
-            if !modified {
+
+            if !mod_reserved && !mod_branch {
                 break;
             }
             iteration += 1;
@@ -315,6 +379,12 @@ impl Assembler6502 {
                         })?;
                     current_address = current_address.wrapping_add(bytes.len() as u16);
                     machine.extend_from_slice(&bytes);
+                }
+                Item::Pad(n) => {
+                    for _ in 0..*n {
+                        machine.push(0);
+                        current_address = current_address.wrapping_add(1);
+                    }
                 }
             }
         }
@@ -571,6 +641,7 @@ impl Assembler6502 {
                     Err(_) => Err(format!("Cannot read file: {}", filename)),
                 }
             }
+            Item::Pad(n) => Ok(*n),
             Item::Org(_) | Item::Label(_) | Item::Constant(_, _) => Ok(0),
         }
     }
@@ -583,6 +654,147 @@ impl Assembler6502 {
                 _ => false,
             })
             .count()
+    }
+
+    /// Sizing pre-pass: walk items to assign label and constant addresses.
+    fn rebuild_symbols(&mut self, instructions: &[Item]) {
+        self.symbols.clear();
+        let mut current_address = self.start_address;
+        for inst in instructions.iter() {
+            match inst {
+                Item::Label(name) => {
+                    self.symbols.insert(name.clone(), current_address);
+                }
+                Item::Constant(name, expr) => {
+                    let eval = ExpressionEvaluator::new(&self.symbols, current_address);
+                    if let Ok(value) = eval.evaluate_u16(expr) {
+                        self.symbols.insert(name.clone(), value);
+                    }
+                }
+                Item::Org(expr) => {
+                    let eval = ExpressionEvaluator::new(&self.symbols, current_address);
+                    if let Ok(addr) = eval.evaluate_u16(expr) {
+                        current_address = addr;
+                    }
+                }
+                _ => {
+                    if let Ok(size) = self.instruction_size(inst, current_address) {
+                        current_address = current_address.wrapping_add(size as u16);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Insert `JMP <end+1>` plus `$00`-fill before any reserved range the
+    /// code would otherwise enter. Idempotent: existing skip-blocks in the
+    /// input are passed through unchanged.
+    pub fn apply_reserved_ranges(&mut self, instructions: &[Item]) -> Result<(Vec<Item>, bool), String> {
+        if self.reserved_ranges.is_empty() {
+            return Ok((instructions.to_vec(), false));
+        }
+
+        self.rebuild_symbols(instructions);
+
+        const JMP_SIZE: u32 = 3;
+        let mut output: Vec<Item> = Vec::with_capacity(instructions.len());
+        let mut pc: u32 = self.start_address as u32;
+        let mut modified = false;
+
+        let mut i = 0usize;
+        while i < instructions.len() {
+            let inst = &instructions[i];
+
+            match inst {
+                Item::Label(_) | Item::Constant(_, _) => {
+                    output.push(inst.clone());
+                    i += 1;
+                    continue;
+                }
+                Item::Org(expr) => {
+                    let eval = ExpressionEvaluator::new(&self.symbols, pc as u16);
+                    if let Ok(addr) = eval.evaluate_u16(expr) {
+                        pc = addr as u32;
+                    }
+                    output.push(inst.clone());
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Pad and JMP-followed-by-Pad come from a prior run of this pass.
+            // The parser never emits Pad, so this is a safe marker.
+            let is_inserted = match inst {
+                Item::Pad(_) => true,
+                Item::Instruction { mnemonic, .. } if mnemonic == "JMP" => {
+                    matches!(instructions.get(i + 1), Some(Item::Pad(_)))
+                }
+                _ => false,
+            };
+
+            if is_inserted {
+                let size = self.instruction_size(inst, pc as u16).unwrap_or(0) as u32;
+                output.push(inst.clone());
+                pc = pc.wrapping_add(size);
+                i += 1;
+                continue;
+            }
+
+            for r in &self.reserved_ranges {
+                if pc >= r.start as u32 && pc <= r.end as u32 {
+                    return Err(format!(
+                        "PC ${:04X} lands inside reserved range ${:04X}-${:04X}",
+                        pc, r.start, r.end
+                    ));
+                }
+            }
+
+            let mut size = self.instruction_size(inst, pc as u16).unwrap_or(0) as u32;
+
+            // Insert a skip-block before any range this item would either
+            // cross or leave too little room (< JMP_SIZE bytes) before.
+            loop {
+                let conflict = self.reserved_ranges.iter().find(|r| {
+                    let r_start = r.start as u32;
+                    pc < r_start && pc + size > r_start.saturating_sub(JMP_SIZE)
+                }).copied();
+
+                let r = match conflict {
+                    Some(r) => r,
+                    None => break,
+                };
+                let r_start = r.start as u32;
+                let r_end = r.end as u32;
+
+                if pc + JMP_SIZE > r_start {
+                    return Err(format!(
+                        "Cannot fit 3-byte JMP before reserved ${:04X}-${:04X}: PC=${:04X}, only {} bytes available",
+                        r.start, r.end, pc, r_start.saturating_sub(pc)
+                    ));
+                }
+
+                let pre_pad = (r_start - JMP_SIZE) - pc;
+                if pre_pad > 0 {
+                    output.push(Item::Pad(pre_pad as usize));
+                }
+                output.push(Item::Instruction {
+                    mnemonic: "JMP".to_string(),
+                    operand: Some(format!("${:04X}", r_end + 1)),
+                });
+                output.push(Item::Pad((r_end - r_start + 1) as usize));
+
+                pc = r_end + 1;
+                modified = true;
+                size = self.instruction_size(inst, pc as u16).unwrap_or(0) as u32;
+            }
+
+            output.push(inst.clone());
+            pc = pc.wrapping_add(size);
+            i += 1;
+        }
+
+        Ok((output, modified))
     }
 
     pub fn fix_long_branches(&mut self, instructions: &[Item]) -> (Vec<Item>, bool) {
@@ -829,6 +1041,13 @@ impl Assembler6502 {
                         current_address = current_address.wrapping_add(bytes.len() as u16);
                     }
                 }
+                Item::Pad(n) => {
+                    println!(
+                        "${:04X}: {:<12} <reserved fill, {} bytes of $00>",
+                        current_address, "", n
+                    );
+                    current_address = current_address.wrapping_add(*n as u16);
+                }
             }
         }
     }
@@ -950,8 +1169,194 @@ impl Assembler6502 {
                         current_address = current_address.wrapping_add(bytes.len() as u16);
                     }
                 }
+                Item::Pad(n) => {
+                    writeln!(
+                        f,
+                        "${:04X}: {:<12} <reserved fill, {} bytes of $00>",
+                        current_address, "", n
+                    )?;
+                    current_address = current_address.wrapping_add(*n as u16);
+                }
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reserved_tests {
+    use super::*;
+
+    fn lda_program(count: usize) -> String {
+        // Each "LDA #$00" is 2 bytes.
+        let mut s = String::from("*=$0800\n");
+        for _ in 0..count {
+            s.push_str("LDA #$00\n");
+        }
+        s
+    }
+
+    #[test]
+    fn no_reserved_ranges_is_unchanged() {
+        let mut a = Assembler6502::new();
+        let bytes = a.assemble_bytes("*=$0800\nLDA #$42\nSTA $0200\n").unwrap();
+        assert_eq!(bytes, vec![0xA9, 0x42, 0x8D, 0x00, 0x02]);
+    }
+
+    #[test]
+    fn add_reserved_validates_bounds() {
+        let mut a = Assembler6502::new();
+        assert!(a.add_reserved_range(0x0900, 0x08FF).is_err()); // start > end
+        assert!(a.add_reserved_range(0x0100, 0xFFFF).is_err()); // end at top
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        // overlap
+        assert!(a.add_reserved_range(0x09F0, 0x0A00).is_err());
+        // gap < 3 (0x0A00 - 0x09FF - 1 = 0)
+        assert!(a.add_reserved_range(0x0A00, 0x0A2F).is_err());
+        // gap == 2
+        assert!(a.add_reserved_range(0x0A02, 0x0A2F).is_err());
+        // gap == 3 OK
+        a.add_reserved_range(0x0A03, 0x0A2F).unwrap();
+    }
+
+    #[test]
+    fn ranges_kept_sorted() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0B00, 0x0B4F).unwrap();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        let r = a.reserved_ranges();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].start, 0x0900);
+        assert_eq!(r[1].start, 0x0B00);
+    }
+
+    #[test]
+    fn small_program_below_reserved_unchanged() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        let bytes = a.assemble_bytes(&lda_program(4)).unwrap();
+        // 4 LDA #$00 = 8 bytes, doesn't reach $0900
+        assert_eq!(bytes.len(), 8);
+        assert!(bytes.iter().all(|&b| b == 0xA9 || b == 0x00));
+    }
+
+    #[test]
+    fn skips_single_range_with_jmp_and_zero_fill() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        // 200 LDAs = 400 bytes, fills well past $0900
+        let bytes = a.assemble_bytes(&lda_program(200)).unwrap();
+
+        // Find the JMP $0A00 (4C 00 0A)
+        let jmp_idx = bytes.windows(3).position(|w| w == [0x4C, 0x00, 0x0A])
+            .expect("JMP $0A00 should be inserted");
+
+        // The JMP must end at offset (0x0900 - 0x0800 - 1) = 0xFF.
+        // So JMP starts at offset 0xFD, ends at 0xFF.
+        assert_eq!(jmp_idx, 0xFD);
+
+        // Bytes from $0900 to $09FF (offsets 0x100..=0x1FF) must be zero
+        for off in 0x100..=0x1FF {
+            assert_eq!(bytes[off], 0x00, "offset {:04X} should be $00", off);
+        }
+        // Code resumes at offset 0x200 (== $0A00)
+        assert_eq!(bytes[0x200], 0xA9); // LDA opcode
+    }
+
+    #[test]
+    fn nop_filled_program_skips_cleanly() {
+        // 1-byte instructions: 253 NOPs end at $08FC, JMP at $08FD-$08FF, fill,
+        // then the trailing LDA lands at $0A00.
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        let mut src = String::from("*=$0800\n");
+        for _ in 0..253 { src.push_str("NOP\n"); }
+        src.push_str("LDA #$11\n");
+        let bytes = a.assemble_bytes(&src).unwrap();
+        for off in 0..253 { assert_eq!(bytes[off], 0xEA); }
+        assert_eq!(&bytes[253..256], &[0x4C, 0x00, 0x0A]);
+        for off in 256..512 { assert_eq!(bytes[off], 0x00); }
+        assert_eq!(&bytes[512..514], &[0xA9, 0x11]);
+    }
+
+    #[test]
+    fn large_string_pushed_entirely_past_reserved() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        let mut src = String::from("*=$0800\n");
+        for _ in 0..240 { src.push_str("NOP\n"); }
+        src.push_str(".string \"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123\"\n");
+        let bytes = a.assemble_bytes(&src).unwrap();
+
+        let pos = bytes.windows(10).position(|w| w == b"ABCDEFGHIJ").unwrap();
+        assert!(pos >= 0x200, "string at offset {:04X}, must be >= $0200", pos);
+        for off in 0x100..=0x1FF { assert_eq!(bytes[off], 0x00); }
+    }
+
+    #[test]
+    fn multiple_ranges_both_skipped() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        a.add_reserved_range(0x0B00, 0x0B4F).unwrap();
+        let bytes = a.assemble_bytes(&lda_program(400)).unwrap();
+
+        let jmp1 = bytes.windows(3).position(|w| w == [0x4C, 0x00, 0x0A]).unwrap();
+        assert_eq!(jmp1, 0xFD);
+        for off in 0x100..=0x1FF { assert_eq!(bytes[off], 0x00); }
+
+        let jmp2 = bytes.windows(3).position(|w| w == [0x4C, 0x50, 0x0B]).unwrap();
+        assert_eq!(jmp2, 0x2FD);
+        for off in 0x300..=0x34F { assert_eq!(bytes[off], 0x00); }
+    }
+
+    #[test]
+    fn assembling_twice_is_idempotent() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        let bytes1 = a.assemble_bytes(&lda_program(200)).unwrap();
+        let bytes2 = a.assemble_bytes(&lda_program(200)).unwrap();
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn long_branch_across_reserved_range() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        let mut src = String::from("*=$0800\nBEQ FAR\n");
+        for _ in 0..200 { src.push_str("LDA #$00\n"); }
+        src.push_str("FAR:\nNOP\n");
+        let bytes = a.assemble_bytes(&src).unwrap();
+
+        assert!(bytes.windows(3).any(|w| w == [0x4C, 0x00, 0x0A]));
+        for off in 0x100..=0x1FF { assert_eq!(bytes[off], 0x00); }
+    }
+
+    #[test]
+    fn no_jmp_when_code_ends_before_reserved() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        // Tiny program. No JMP should be inserted.
+        let bytes = a.assemble_bytes("*=$0800\nLDA #$42\nRTS\n").unwrap();
+        assert_eq!(bytes, vec![0xA9, 0x42, 0x60]);
+    }
+
+    #[test]
+    fn org_into_reserved_range_errors() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        let res = a.assemble_bytes("*=$0950\nLDA #$00\n");
+        assert!(res.is_err(), "ORG into reserved should fail");
+    }
+
+    #[test]
+    fn clear_reserved_ranges_resets() {
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        assert_eq!(a.reserved_ranges().len(), 1);
+        a.clear_reserved_ranges();
+        assert_eq!(a.reserved_ranges().len(), 0);
+        // After clearing, code below $0900 produces normal output.
+        let bytes = a.assemble_bytes("*=$0800\nLDA #$42\n").unwrap();
+        assert_eq!(bytes, vec![0xA9, 0x42]);
     }
 }

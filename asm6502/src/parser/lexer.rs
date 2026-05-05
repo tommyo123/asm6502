@@ -15,6 +15,7 @@ pub enum Item {
     String(String),            // .string "text"
     IncBin(String),            // .incbin "filename"
     Org(Expr),
+    Pad(usize),                // emit N zero bytes (internal: reserved-range filler)
 }
 
 #[derive(Clone, Debug)]

@@ -4,6 +4,7 @@
 //!     "<" => force Zero Page (e.g. LDA <$80, LDA <$80,X)
 //!     ">" => force Absolute  (e.g. LDA >$80, LDA >$80,X)
 //! - Adaptive long-branch fixing pass count (bounded by number of branches + 2)
+//! - Reserved memory ranges: skip configured regions with `JMP` + zero-fill
 //!
 //! ## Features
 //! - **Hex-only syntax** (`$` prefix for hex numbers).
@@ -15,6 +16,9 @@
 //! - **Force addressing mode** using operand prefixes:
 //!   - `<` → force Zero Page (e.g. `LDA <$80`).
 //!   - `>` → force Absolute (e.g. `LDA >$80`).
+//! - **Reserved ranges**: `add_reserved_range(start, end)` skips a region with
+//!   a `JMP <end+1>`; the range is zero-filled and indivisible data blocks
+//!   are pushed past it.
 //!
 //! ## Optional Features
 //! - `listing`: enables functions to print and save human-readable assembly listings.
@@ -47,8 +51,10 @@ mod symbol;
 mod parser;
 mod addressing;
 mod eval;
+mod reserved;
 mod assembler;
 
 // Public exports
 pub use error::AsmError;
 pub use assembler::{Assembler6502, Item};
+pub use reserved::ReservedRange;

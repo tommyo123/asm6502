@@ -39,6 +39,7 @@ A minimal 6502 assembler written in Rust for inline assembly and lightweight com
         * `<$80` → force Zero Page addressing
         * `>$80` → force Absolute addressing
 * **Adaptive long-branch expansion:** Out-of-range branches automatically become `BRANCH skip` + `JMP target`
+* **Reserved memory ranges:** Skip regions of memory (`add_reserved_range`) — the assembler emits a `JMP` past each range and zero-fills it
 * **Whitespace-friendly:** Spaces allowed in operands: `LDA #<($10000 - $100)`
 * **Optional listing output:** Print to stdout and/or save to file (feature-gated)
 * **Symbol table & address mapping helpers**
@@ -533,7 +534,32 @@ fn lookup(&self, name: &str) -> Option<u16>
 
 // Binary output
 fn write_bin<W: Write>(bytes: &[u8], w: W) -> io::Result<()>
+
+// Reserved memory ranges
+fn add_reserved_range(&mut self, start: u16, end: u16) -> Result<(), AsmError>
+fn clear_reserved_ranges(&mut self)
+fn reserved_ranges(&self) -> &[ReservedRange]
 ```
+
+### Reserved Memory Ranges
+
+Mark address ranges the assembler must not place code in. When the program
+counter would otherwise enter a reserved range, the assembler inserts a
+`JMP <end+1>` and zero-fills the range. Indivisible blocks (`.string`,
+`.byte`, `.word`, `.incbin`) that would cross a range are placed in full
+after it.
+
+```rust
+let mut a = Assembler6502::new();
+a.add_reserved_range(0x0900, 0x09FF)?;  // skip 256 bytes
+a.add_reserved_range(0x0B00, 0x0B4F)?;  // skip 80 bytes
+let bytes = a.assemble_bytes(src)?;
+```
+
+Rules:
+- `start <= end`, `end < $FFFF`, no overlap with existing ranges.
+- Ranges must be at least 3 bytes apart (room for the `JMP`).
+- Setting origin (`*=`) inside a reserved range is an error.
 
 ### Listing Methods (feature-gated)
 
@@ -634,7 +660,13 @@ Constants and expressions are evaluated in-order, requiring definitions before u
 
 ## Version History
 
-### v2.2 (Current)
+### v2.3 (Current)
+- Reserved memory ranges: `add_reserved_range`, `clear_reserved_ranges`, `reserved_ranges`
+- Reserved regions are skipped with a `JMP <end+1>` and zero-filled; indivisible data blocks are pushed past the range
+- Reserved-range insertion and long-branch expansion share a convergence loop, so both can interact safely
+- Backwards compatible: existing programs assemble identically when no reserved ranges are configured
+
+### v2.2
 - Fixed long branch expansion: branch condition is now correctly inverted in the `BXX -> BYY skip; JMP far; skip:` rewrite
 - Fixed `__skip_<n>` label collisions across fix-up iterations by promoting the counter to per-assembler state
 - Both bugs could produce incorrect machine code or non-converging fix-up loops on programs large enough to need a long-branch expansion
