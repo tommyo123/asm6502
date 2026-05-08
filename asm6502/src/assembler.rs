@@ -687,8 +687,8 @@ impl Assembler6502 {
     }
 
     /// Insert `JMP <end+1>` plus `$00`-fill before any reserved range the
-    /// code would otherwise enter. Idempotent: existing skip-blocks in the
-    /// input are passed through unchanged.
+    /// code would otherwise enter. Existing bridges from prior passes
+    /// have their pre_pad re-sized against the current PC.
     pub fn apply_reserved_ranges(&mut self, instructions: &[Item]) -> Result<(Vec<Item>, bool), String> {
         if self.reserved_ranges.is_empty() {
             return Ok((instructions.to_vec(), false));
@@ -723,21 +723,44 @@ impl Assembler6502 {
                 _ => {}
             }
 
-            // Pad and JMP-followed-by-Pad come from a prior run of this pass.
-            // The parser never emits Pad, so this is a safe marker.
-            let is_inserted = match inst {
-                Item::Pad(_) => true,
-                Item::Instruction { mnemonic, .. } if mnemonic == "JMP" => {
-                    matches!(instructions.get(i + 1), Some(Item::Pad(_)))
-                }
-                _ => false,
-            };
+            // Existing bridge: rewrite pre_pad against current PC.
+            let bridge = detect_bridge(instructions, i, &self.reserved_ranges);
+            if let Some(b) = bridge {
+                let r_start = b.r_start;
+                let r_end = b.r_end;
 
-            if is_inserted {
-                let size = self.instruction_size(inst, pc as u16).unwrap_or(0) as u32;
-                output.push(inst.clone());
-                pc = pc.wrapping_add(size);
-                i += 1;
+                // PC already past the reserved range — drop the bridge.
+                if pc > r_end {
+                    modified = true;
+                    i = b.post_pad_idx + 1;
+                    continue;
+                }
+
+                if pc + JMP_SIZE > r_start {
+                    return Err(format!(
+                        "Cannot fit 3-byte JMP before reserved ${:04X}-${:04X}: PC=${:04X}, only {} bytes available",
+                        r_start as u16, r_end as u16, pc, r_start.saturating_sub(pc)
+                    ));
+                }
+
+                let want_pre_pad = (r_start - JMP_SIZE) - pc;
+                let have_pre_pad = b
+                    .pre_pad_idx
+                    .and_then(|idx| match &instructions[idx] {
+                        Item::Pad(n) => Some(*n as u32),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                if want_pre_pad != have_pre_pad {
+                    modified = true;
+                }
+                if want_pre_pad > 0 {
+                    output.push(Item::Pad(want_pre_pad as usize));
+                }
+                output.push(instructions[b.jmp_idx].clone());
+                output.push(instructions[b.post_pad_idx].clone());
+                pc = r_end + 1;
+                i = b.post_pad_idx + 1;
                 continue;
             }
 
@@ -1183,6 +1206,61 @@ impl Assembler6502 {
     }
 }
 
+struct BridgeAt {
+    pre_pad_idx: Option<usize>,
+    jmp_idx: usize,
+    post_pad_idx: usize,
+    r_start: u32,
+    r_end: u32,
+}
+
+/// Recognise a `[Pad,] JMP $XXXX, Pad` bridge at position `i` whose
+/// JMP target equals `r.end + 1` for some reserved range.
+fn detect_bridge(
+    instructions: &[Item],
+    i: usize,
+    reserved_ranges: &[ReservedRange],
+) -> Option<BridgeAt> {
+    fn jmp_to_bridge_target(inst: &Item, ranges: &[ReservedRange]) -> Option<u32> {
+        let Item::Instruction { mnemonic, operand: Some(op) } = inst else {
+            return None;
+        };
+        if mnemonic != "JMP" {
+            return None;
+        }
+        let target = u32::from_str_radix(op.strip_prefix('$')?, 16).ok()?;
+        ranges.iter().any(|r| r.end as u32 + 1 == target).then_some(target)
+    }
+    let inst = instructions.get(i)?;
+    if matches!(inst, Item::Pad(_)) {
+        let next = instructions.get(i + 1)?;
+        let target = jmp_to_bridge_target(next, reserved_ranges)?;
+        if matches!(instructions.get(i + 2), Some(Item::Pad(_))) {
+            let r = reserved_ranges.iter().find(|r| r.end as u32 + 1 == target)?;
+            return Some(BridgeAt {
+                pre_pad_idx: Some(i),
+                jmp_idx: i + 1,
+                post_pad_idx: i + 2,
+                r_start: r.start as u32,
+                r_end: r.end as u32,
+            });
+        }
+    }
+    if let Some(target) = jmp_to_bridge_target(inst, reserved_ranges) {
+        if matches!(instructions.get(i + 1), Some(Item::Pad(_))) {
+            let r = reserved_ranges.iter().find(|r| r.end as u32 + 1 == target)?;
+            return Some(BridgeAt {
+                pre_pad_idx: None,
+                jmp_idx: i,
+                post_pad_idx: i + 1,
+                r_start: r.start as u32,
+                r_end: r.end as u32,
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod reserved_tests {
     use super::*;
@@ -1358,5 +1436,32 @@ mod reserved_tests {
         // After clearing, code below $0900 produces normal output.
         let bytes = a.assemble_bytes("*=$0800\nLDA #$42\n").unwrap();
         assert_eq!(bytes, vec![0xA9, 0x42]);
+    }
+
+    /// Two reservations + many forward long-branches — branch
+    /// expansion shifts existing bridges and their pre_pads must be
+    /// re-sized against the new PC.
+    #[test]
+    fn two_reservations_with_long_forward_branches_converge() {
+        let mut asm = String::from("*=$0810\nstart:\n");
+        let label_count = 50;
+        for i in 0..label_count {
+            asm.push_str(&format!("    BNE far_{i}\n"));
+            for _ in 0..50 {
+                asm.push_str("    NOP\n");
+            }
+        }
+        for _ in 0..15000 {
+            asm.push_str("    NOP\n");
+        }
+        for i in 0..label_count {
+            asm.push_str(&format!("far_{i}:\n"));
+            asm.push_str("    NOP\n");
+        }
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x3000, 0x34C0).unwrap();
+        a.add_reserved_range(0x3800, 0x3FFF).unwrap();
+        let result = a.assemble_bytes(&asm);
+        assert!(result.is_ok(), "two reservations + long branches: {result:?}");
     }
 }
