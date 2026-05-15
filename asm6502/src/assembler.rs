@@ -687,8 +687,11 @@ impl Assembler6502 {
     }
 
     /// Insert `JMP <end+1>` plus `$00`-fill before any reserved range the
-    /// code would otherwise enter. Existing bridges from prior passes
-    /// have their pre_pad re-sized against the current PC.
+    /// code would otherwise enter. The JMP is placed *immediately* at
+    /// the current PC (no executable pre-pad), so a CPU that walks
+    /// naturally past the previous instruction hits the JMP on its
+    /// very next fetch — no fall-through over bytes that the user
+    /// program might POKE over and turn back into a stray BRK.
     pub fn apply_reserved_ranges(&mut self, instructions: &[Item]) -> Result<(Vec<Item>, bool), String> {
         if self.reserved_ranges.is_empty() {
             return Ok((instructions.to_vec(), false));
@@ -723,10 +726,13 @@ impl Assembler6502 {
                 _ => {}
             }
 
-            // Existing bridge: rewrite pre_pad against current PC.
+            // Existing bridge: re-emit it at the current PC. The JMP
+            // sits at PC directly; the post-pad covers everything from
+            // (PC + JMP_SIZE) up through r_end, including the gap
+            // between the JMP and r_start (those bytes are dead — the
+            // JMP unconditionally jumps over them — so $00 is fine).
             let bridge = detect_bridge(instructions, i, &self.reserved_ranges);
             if let Some(b) = bridge {
-                let r_start = b.r_start;
                 let r_end = b.r_end;
 
                 // PC already past the reserved range — drop the bridge.
@@ -736,29 +742,28 @@ impl Assembler6502 {
                     continue;
                 }
 
-                if pc + JMP_SIZE > r_start {
+                if pc + JMP_SIZE > b.r_start {
                     return Err(format!(
                         "Cannot fit 3-byte JMP before reserved ${:04X}-${:04X}: PC=${:04X}, only {} bytes available",
-                        r_start as u16, r_end as u16, pc, r_start.saturating_sub(pc)
+                        b.r_start as u16, r_end as u16, pc, b.r_start.saturating_sub(pc)
                     ));
                 }
 
-                let want_pre_pad = (r_start - JMP_SIZE) - pc;
-                let have_pre_pad = b
-                    .pre_pad_idx
-                    .and_then(|idx| match &instructions[idx] {
-                        Item::Pad(n) => Some(*n as u32),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                if want_pre_pad != have_pre_pad {
+                // If the previous bridge had any pre-pad, it's now
+                // gone — JMP at PC means no leading bytes.
+                if b.pre_pad_idx.is_some() {
                     modified = true;
                 }
-                if want_pre_pad > 0 {
-                    output.push(Item::Pad(want_pre_pad as usize));
+                let want_post_pad = r_end + 1 - (pc + JMP_SIZE);
+                let have_post_pad = match &instructions[b.post_pad_idx] {
+                    Item::Pad(n) => *n as u32,
+                    _ => 0,
+                };
+                if want_post_pad != have_post_pad {
+                    modified = true;
                 }
                 output.push(instructions[b.jmp_idx].clone());
-                output.push(instructions[b.post_pad_idx].clone());
+                output.push(Item::Pad(want_post_pad as usize));
                 pc = r_end + 1;
                 i = b.post_pad_idx + 1;
                 continue;
@@ -797,15 +802,20 @@ impl Assembler6502 {
                     ));
                 }
 
-                let pre_pad = (r_start - JMP_SIZE) - pc;
-                if pre_pad > 0 {
-                    output.push(Item::Pad(pre_pad as usize));
-                }
+                // Place the JMP at PC directly. The bytes between
+                // the JMP and r_start are dead code — the JMP jumps
+                // over them unconditionally — so $00 fill is safe.
+                // A pre-pad before the JMP would be UNSAFE: those
+                // bytes would execute on natural fall-through, and
+                // any user POKE that lands on them (the assembler's
+                // reservation only protects r_start..=r_end, not the
+                // gap before) could turn them back into stray opcodes.
                 output.push(Item::Instruction {
                     mnemonic: "JMP".to_string(),
                     operand: Some(format!("${:04X}", r_end + 1)),
                 });
-                output.push(Item::Pad((r_end - r_start + 1) as usize));
+                let post_pad = r_end + 1 - (pc + JMP_SIZE);
+                output.push(Item::Pad(post_pad as usize));
 
                 pc = r_end + 1;
                 modified = true;
@@ -1319,6 +1329,43 @@ mod reserved_tests {
     }
 
     #[test]
+    fn bridge_jmp_sits_at_pc_no_fallthrough_zone() {
+        // Regression: the bytes between the last user instruction
+        // and the JMP-bridge used to be emitted as $00 (BRK). When
+        // the CPU walked naturally past the previous instruction
+        // into those padding bytes, BRK fired and trapped to the
+        // KERNAL break handler — for YABCompiler-compiled BASIC
+        // that means an immediate return to BASIC's READY, killing
+        // the running program.
+        //
+        // The fix is structural, not a "make the pad bytes safer"
+        // patch: the JMP is now placed at the current PC directly,
+        // so the CPU's very next fetch IS the JMP. There are no
+        // executable bytes between the previous instruction and
+        // the JMP at all — no fall-through zone for a stray POKE
+        // or a misaligned decode to corrupt back into a BRK.
+        //
+        // Layout: 127 LDA #$00 (2 bytes each). 126 fit at
+        // $0800-$08FB; the 127th would land at $08FC-$08FD which
+        // straddles the JMP zone, so the bridge gets inserted at
+        // the current PC ($08FC). JMP is at offset 0xFC, the byte
+        // at 0xFF is dead-fill (between JMP-end and r_start), and
+        // the deferred 127th LDA resumes at $0A00 (offset 0x200).
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x0900, 0x09FF).unwrap();
+        let bytes = a.assemble_bytes(&lda_program(127)).unwrap();
+
+        let jmp_idx = bytes.windows(3).position(|w| w == [0x4C, 0x00, 0x0A])
+            .expect("JMP $0A00 should be inserted");
+        // JMP sits AT pc ($08FC). The CPU fetches it on its very
+        // next step after the previous LDA at $08FA.
+        assert_eq!(jmp_idx, 0xFC);
+        // Code resumes at offset 0x200 (== $0A00) with the
+        // deferred 127th LDA.
+        assert_eq!(bytes[0x200], 0xA9);
+    }
+
+    #[test]
     fn skips_single_range_with_jmp_and_zero_fill() {
         let mut a = Assembler6502::new();
         a.add_reserved_range(0x0900, 0x09FF).unwrap();
@@ -1329,12 +1376,17 @@ mod reserved_tests {
         let jmp_idx = bytes.windows(3).position(|w| w == [0x4C, 0x00, 0x0A])
             .expect("JMP $0A00 should be inserted");
 
-        // The JMP must end at offset (0x0900 - 0x0800 - 1) = 0xFF.
-        // So JMP starts at offset 0xFD, ends at 0xFF.
-        assert_eq!(jmp_idx, 0xFD);
+        // 126 LDAs (252 bytes) fill $0800-$08FB. The 127th would
+        // straddle the JMP zone, so the bridge gets inserted at the
+        // current PC ($08FC). JMP at offset 0xFC; the byte at 0xFF
+        // is dead-fill (between JMP-end and the reservation start)
+        // — never executed because the JMP unconditionally jumps
+        // over it.
+        assert_eq!(jmp_idx, 0xFC);
 
-        // Bytes from $0900 to $09FF (offsets 0x100..=0x1FF) must be zero
-        for off in 0x100..=0x1FF {
+        // Bytes from offset 0xFF (dead-fill) through 0x1FF (the
+        // reservation $0900-$09FF) must all be $00.
+        for off in 0xFF..=0x1FF {
             assert_eq!(bytes[off], 0x00, "offset {:04X} should be $00", off);
         }
         // Code resumes at offset 0x200 (== $0A00)
@@ -1378,13 +1430,18 @@ mod reserved_tests {
         a.add_reserved_range(0x0B00, 0x0B4F).unwrap();
         let bytes = a.assemble_bytes(&lda_program(400)).unwrap();
 
+        // First bridge: JMP at $08FC (offset 0xFC). Dead-fill $08FF
+        // and the reservation $0900-$09FF must all be $00.
         let jmp1 = bytes.windows(3).position(|w| w == [0x4C, 0x00, 0x0A]).unwrap();
-        assert_eq!(jmp1, 0xFD);
-        for off in 0x100..=0x1FF { assert_eq!(bytes[off], 0x00); }
+        assert_eq!(jmp1, 0xFC);
+        for off in 0xFF..=0x1FF { assert_eq!(bytes[off], 0x00); }
 
+        // Second bridge: 126 more LDAs fill $0A00-$0AFB, JMP $0B50
+        // at $0AFC (offset 0x2FC). Dead-fill $0AFF and reservation
+        // $0B00-$0B4F must all be $00.
         let jmp2 = bytes.windows(3).position(|w| w == [0x4C, 0x50, 0x0B]).unwrap();
-        assert_eq!(jmp2, 0x2FD);
-        for off in 0x300..=0x34F { assert_eq!(bytes[off], 0x00); }
+        assert_eq!(jmp2, 0x2FC);
+        for off in 0x2FF..=0x34F { assert_eq!(bytes[off], 0x00); }
     }
 
     #[test]
