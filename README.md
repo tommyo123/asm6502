@@ -660,7 +660,12 @@ Constants and expressions are evaluated in-order, requiring definitions before u
 
 ## Version History
 
-### v2.3 (Current)
+### v2.4 (Current)
+- Reserved-range `JMP` is now emitted directly at the program counter, eliminating fall-through zones before the skip
+- Reworked bridge handling: existing bridges and pre-pads are re-adjusted against the current PC during convergence, so reserved-range fix-ups settle correctly when combined with long-branch expansion
+- Added `detect_bridge` helper and unit tests covering bridge-convergence scenarios and stricter post-pad correctness
+
+### v2.3
 - Reserved memory ranges: `add_reserved_range`, `clear_reserved_ranges`, `reserved_ranges`
 - Reserved regions are skipped with a `JMP <end+1>` and zero-filled; indivisible data blocks are pushed past the range
 - Reserved-range insertion and long-branch expansion share a convergence loop, so both can interact safely
