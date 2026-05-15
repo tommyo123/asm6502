@@ -36,6 +36,19 @@ impl SymbolTable {
         self.labels.clone()
     }
 
+    /// Shift every label whose address lies strictly above `pivot` by
+    /// `delta` bytes. Used by `fix_long_branches` after expanding a
+    /// branch in-place: the +3 bytes the expansion adds push every
+    /// later label forward, and without this fix-up the same pass
+    /// would compute reach using the pre-expansion addresses.
+    pub fn shift_above(&mut self, pivot: u16, delta: u16) {
+        for addr in self.labels.values_mut() {
+            if *addr > pivot {
+                *addr = addr.wrapping_add(delta);
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn mark_zp(&mut self, name: String) {
         self.zp_labels.insert(name);

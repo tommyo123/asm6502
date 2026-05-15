@@ -660,7 +660,13 @@ Constants and expressions are evaluated in-order, requiring definitions before u
 
 ## Version History
 
-### v2.4 (Current)
+### v2.5 (Current)
+- **Bridge/long-branch convergence fix:** When a reserved-range bridge would land between the inverted branch and the `Label(__skip_N)` of a long-branch expansion, the bridge is now deferred to *before* the inverted branch so the BR+JMP+Label triple stays atomic and reaches its skip target in range. Without this, the split made the inverted branch out-of-range, `fix_long_branches` re-expanded it, the next pass's bridge landed one byte earlier, and the outer convergence loop never settled.
+- **In-pass symbol shift:** `fix_long_branches` now adjusts every symbol that lives strictly above an expansion point by +3 bytes as soon as the expansion is emitted, so later branches in the same pass reach their targets through addresses that already reflect the in-progress code growth instead of the stale pre-expansion build.
+- **Structural bridge marker:** Bridges are emitted as `Item::Pad(0) + JMP + Item::Pad(N)` and `detect_bridge` only matches that exact triple. The zero-size leading pad keeps `apply_reserved_ranges` from re-wrapping a stock user `JMP` whose target happens to land one byte past a reserved range.
+- New regression tests cover the bridge-cycle scenario, the in-pass symbol shift, and the structural marker.
+
+### v2.4
 - Reserved-range `JMP` is now emitted directly at the program counter, eliminating fall-through zones before the skip
 - Reworked bridge handling: existing bridges and pre-pads are re-adjusted against the current PC during convergence, so reserved-range fix-ups settle correctly when combined with long-branch expansion
 - Added `detect_bridge` helper and unit tests covering bridge-convergence scenarios and stricter post-pad correctness

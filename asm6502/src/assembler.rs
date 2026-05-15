@@ -237,7 +237,7 @@ impl Assembler6502 {
         // Adaptive pass limit. Both reserved-range insertion and long-branch
         // expansion only ever ADD items, so convergence is guaranteed; the
         // bound just covers worst-case interleaving.
-        let mut guard = self.count_branches(&instructions) + self.reserved_ranges.len() + 4;
+        let mut guard = self.count_branches(&instructions) * 4 + self.reserved_ranges.len() + 16;
         let mut iteration = 0;
         loop {
             let (after_reserved, mod_reserved) = self.apply_reserved_ranges(&instructions)?;
@@ -749,19 +749,21 @@ impl Assembler6502 {
                     ));
                 }
 
-                // If the previous bridge had any pre-pad, it's now
-                // gone — JMP at PC means no leading bytes.
-                if b.pre_pad_idx.is_some() {
-                    modified = true;
-                }
+                // Re-emit the bridge marker, JMP, and post-pad
+                // sized to the *current* PC. The leading `Item::Pad(0)`
+                // is the structural marker the new-bridge path emits
+                // (see comment there); preserve it so later passes
+                // continue to recognise this triple as a bridge.
                 let want_post_pad = r_end + 1 - (pc + JMP_SIZE);
                 let have_post_pad = match &instructions[b.post_pad_idx] {
                     Item::Pad(n) => *n as u32,
                     _ => 0,
                 };
-                if want_post_pad != have_post_pad {
+                let had_marker = b.pre_pad_idx.is_some();
+                if want_post_pad != have_post_pad || !had_marker {
                     modified = true;
                 }
+                output.push(Item::Pad(0));
                 output.push(instructions[b.jmp_idx].clone());
                 output.push(Item::Pad(want_post_pad as usize));
                 pc = r_end + 1;
@@ -779,6 +781,72 @@ impl Assembler6502 {
             }
 
             let mut size = self.instruction_size(inst, pc as u16).unwrap_or(0) as u32;
+
+            // Long-branch-expansion sequences (`BR __skip_N + JMP
+            // + Label(__skip_N)`) are atomic: splitting them with
+            // a bridge between the inverted branch and the JMP
+            // pushes the `__skip_N` label past the reservation,
+            // turning the inverted branch's 3-byte forward jump
+            // into a 1000+ byte one. `fix_long_branches` then
+            // re-expands the inverted branch on the next iteration,
+            // shifts the code by 3 bytes, the next pass's bridge
+            // lands one byte earlier — and the outer convergence
+            // loop never settles. When the *JMP half* of such a
+            // sequence triggers the conflict, pop the preceding
+            // inverted branch from `output` and emit the bridge at
+            // its earlier PC, then re-emit the whole triple after
+            // the bridge so the entire sequence sits past the
+            // reservation.
+            let split_fixup = if let Some(prev_branch) = output.last().cloned() {
+                let next_in = instructions.get(i + 1).cloned();
+                if is_inverted_branch_into_skip(&prev_branch, inst, next_in.as_ref()) {
+                    // Find the smallest reservation that crosses the
+                    // triple: BR(2) + JMP(3) + Label(0) starting at
+                    // pc - 2 (= BR's PC).
+                    let br_pc = pc.wrapping_sub(2);
+                    self.reserved_ranges.iter().find(|r| {
+                        let r_start = r.start as u32;
+                        br_pc < r_start && br_pc + 5 > r_start.saturating_sub(JMP_SIZE)
+                    }).copied().map(|r| (r, prev_branch, next_in))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some((r, prev_branch, next_in)) = split_fixup {
+                let r_start = r.start as u32;
+                let r_end = r.end as u32;
+                let br_pc = pc.wrapping_sub(2);
+                if br_pc + JMP_SIZE > r_start {
+                    return Err(format!(
+                        "Cannot fit 3-byte JMP before reserved ${:04X}-${:04X}: PC=${:04X}, only {} bytes available",
+                        r.start, r.end, br_pc, r_start.saturating_sub(br_pc)
+                    ));
+                }
+                output.pop(); // remove BR
+                let post_pad = r_end + 1 - (br_pc + JMP_SIZE);
+                output.push(Item::Pad(0));
+                output.push(Item::Instruction {
+                    mnemonic: "JMP".to_string(),
+                    operand: Some(format!("${:04X}", r_end + 1)),
+                });
+                output.push(Item::Pad(post_pad as usize));
+                let mut new_pc = r_end + 1;
+                output.push(prev_branch);
+                new_pc = new_pc.wrapping_add(2);
+                output.push(inst.clone());
+                new_pc = new_pc.wrapping_add(3);
+                if let Some(lbl) = next_in {
+                    output.push(lbl);
+                    i += 1;
+                }
+                pc = new_pc;
+                modified = true;
+                i += 1;
+                continue;
+            }
 
             // Insert a skip-block before any range this item would either
             // cross or leave too little room (< JMP_SIZE bytes) before.
@@ -810,6 +878,18 @@ impl Assembler6502 {
                 // any user POKE that lands on them (the assembler's
                 // reservation only protects r_start..=r_end, not the
                 // gap before) could turn them back into stray opcodes.
+                //
+                // The leading `Item::Pad(0)` is a zero-size structural
+                // marker: it emits no bytes (PC is unchanged in both
+                // the build pass and the binary), but it lets
+                // `detect_bridge` recognise this triple as an existing
+                // bridge on later passes without mistaking a user
+                // `JMP $<r_end+1>` followed by an unrelated `Item::Pad`
+                // for one. Without the marker, a stock `JMP` in user
+                // code that happens to target the byte after a
+                // reservation would be re-wrapped on every iteration
+                // and the outer convergence loop would never settle.
+                output.push(Item::Pad(0));
                 output.push(Item::Instruction {
                     mnemonic: "JMP".to_string(),
                     operand: Some(format!("${:04X}", r_end + 1)),
@@ -909,6 +989,27 @@ impl Assembler6502 {
                                 let skip_label = format!("__skip_{}", self.skip_label_counter);
                                 self.skip_label_counter += 1;
 
+                                // Record the pre-expansion branch
+                                // address; we use it below to shift
+                                // every label that sits AFTER the
+                                // branch by the +3 bytes the expansion
+                                // adds. Without this in-pass fix-up,
+                                // later branches in the same pass
+                                // consult a stale symbol table — the
+                                // entries built before the loop — and
+                                // miscompute their reach. The most
+                                // visible symptom: borderline branches
+                                // (true reach > 127, calculated reach
+                                // ≤ 127 because the target's address
+                                // is stale-too-low) get left
+                                // unexpanded this pass, only to be
+                                // picked up by the next outer-loop
+                                // iteration. With many such borderline
+                                // branches the outer guard runs out
+                                // before convergence. Aussie Cricket
+                                // (~237 branches) hits this exactly.
+                                let expansion_at = current_address;
+
                                 // BYY __skip (2 bytes at current_address)
                                 fixed.push(Item::Instruction {
                                     mnemonic: inverted.to_string(),
@@ -925,6 +1026,14 @@ impl Assembler6502 {
 
                                 // __skip: label (0 bytes - just marks position)
                                 fixed.push(Item::Label(skip_label));
+
+                                // Slide every symbol that lives strictly
+                                // after the branch's original position
+                                // forward by 3 bytes (the net growth of
+                                // the expansion: 5 emitted bytes minus
+                                // the 2-byte branch it replaced). Labels
+                                // at or before `expansion_at` stay put.
+                                self.symbols.shift_above(expansion_at, 3);
 
                                 modified = true;
                                 continue;
@@ -1226,6 +1335,35 @@ struct BridgeAt {
 
 /// Recognise a `[Pad,] JMP $XXXX, Pad` bridge at position `i` whose
 /// JMP target equals `r.end + 1` for some reserved range.
+/// True when `prev` is an inverted branch with a `__skip_*` target,
+/// `curr` is `JMP` (typically the long-branch's far-target jump),
+/// and `next` is the matching `Label(__skip_*)` — the three-item
+/// pattern `fix_long_branches` emits when expanding a long branch.
+/// Used by `apply_reserved_ranges` to detect that an incoming bridge
+/// is about to split the triple and to defer the bridge to before
+/// the inverted branch instead.
+fn is_inverted_branch_into_skip(prev: &Item, curr: &Item, next: Option<&Item>) -> bool {
+    let Item::Instruction { mnemonic: br_mn, operand: Some(br_op) } = prev else {
+        return false;
+    };
+    if !is_branch(br_mn) {
+        return false;
+    }
+    if !br_op.starts_with("__skip_") {
+        return false;
+    }
+    let Item::Instruction { mnemonic: jmp_mn, .. } = curr else {
+        return false;
+    };
+    if jmp_mn != "JMP" {
+        return false;
+    }
+    let Some(Item::Label(label_name)) = next else {
+        return false;
+    };
+    label_name == br_op
+}
+
 fn detect_bridge(
     instructions: &[Item],
     i: usize,
@@ -1241,34 +1379,30 @@ fn detect_bridge(
         let target = u32::from_str_radix(op.strip_prefix('$')?, 16).ok()?;
         ranges.iter().any(|r| r.end as u32 + 1 == target).then_some(target)
     }
-    let inst = instructions.get(i)?;
-    if matches!(inst, Item::Pad(_)) {
-        let next = instructions.get(i + 1)?;
-        let target = jmp_to_bridge_target(next, reserved_ranges)?;
-        if matches!(instructions.get(i + 2), Some(Item::Pad(_))) {
-            let r = reserved_ranges.iter().find(|r| r.end as u32 + 1 == target)?;
-            return Some(BridgeAt {
-                pre_pad_idx: Some(i),
-                jmp_idx: i + 1,
-                post_pad_idx: i + 2,
-                r_start: r.start as u32,
-                r_end: r.end as u32,
-            });
-        }
+    // A bridge is the exact triple `Item::Pad + JMP <past r_end> +
+    // Item::Pad`. The leading Pad is a structural marker emitted by
+    // the bridge-insertion path (often size 0); without it, a stock
+    // user `JMP $X` followed by an unrelated `Item::Pad` whose
+    // target happens to be `r_end + 1` would be misidentified as a
+    // bridge and re-wrapped on every pass, preventing convergence
+    // of the outer reserve/long-branch loop.
+    if !matches!(instructions.get(i), Some(Item::Pad(_))) {
+        return None;
     }
-    if let Some(target) = jmp_to_bridge_target(inst, reserved_ranges) {
-        if matches!(instructions.get(i + 1), Some(Item::Pad(_))) {
-            let r = reserved_ranges.iter().find(|r| r.end as u32 + 1 == target)?;
-            return Some(BridgeAt {
-                pre_pad_idx: None,
-                jmp_idx: i,
-                post_pad_idx: i + 1,
-                r_start: r.start as u32,
-                r_end: r.end as u32,
-            });
-        }
+    let jmp_idx = i + 1;
+    let inst = instructions.get(jmp_idx)?;
+    let target = jmp_to_bridge_target(inst, reserved_ranges)?;
+    if !matches!(instructions.get(jmp_idx + 1), Some(Item::Pad(_))) {
+        return None;
     }
-    None
+    let r = reserved_ranges.iter().find(|r| r.end as u32 + 1 == target)?;
+    Some(BridgeAt {
+        pre_pad_idx: Some(i),
+        jmp_idx,
+        post_pad_idx: jmp_idx + 1,
+        r_start: r.start as u32,
+        r_end: r.end as u32,
+    })
 }
 
 #[cfg(test)]
@@ -1363,6 +1497,51 @@ mod reserved_tests {
         // Code resumes at offset 0x200 (== $0A00) with the
         // deferred 127th LDA.
         assert_eq!(bytes[0x200], 0xA9);
+    }
+
+    #[test]
+    fn bridge_does_not_split_long_branch_expansion() {
+        // Regression: when a reserved-range bridge would land
+        // between the inverted branch and the matching
+        // `Label(__skip_N)` of a long-branch expansion, the
+        // assembler used to insert the bridge in the middle of
+        // that BR+JMP+Label triple. Splitting it pushed the
+        // `__skip_N` label past the reservation, made the
+        // inverted branch's 3-byte forward jump grow to 1000+
+        // bytes, and `fix_long_branches` then re-expanded it on
+        // the next iteration — shifting code by 3 bytes, moving
+        // the next bridge one byte earlier, and spinning the
+        // outer convergence loop indefinitely. The fix detects
+        // the splitting case and emits the bridge BEFORE the
+        // inverted branch so the whole triple sits past the
+        // reservation in range.
+        //
+        // Setup: a long forward branch that needs expansion AND
+        // whose expansion lands on top of a reservation boundary.
+        let mut a = Assembler6502::new();
+        a.add_reserved_range(0x3000, 0x33FF).unwrap();
+        let mut src = String::from("*=$0800\n");
+        // Fill ~$0800-$2FF8 with NOPs (8K minus a handful).
+        for _ in 0..0x27F9 { src.push_str("NOP\n"); }
+        // A forward branch whose target is past the reservation
+        // — expansion forces it through `BR __skip + JMP FAR
+        // + Label(__skip)` and the JMP would otherwise straddle
+        // the reservation start.
+        src.push_str("BCC FAR\n");
+        // Pad up to the reservation boundary with one byte to
+        // come — the JMP would otherwise straddle the reserved
+        // range start at $3000.
+        // After ~$2FF8 + 2 (BCC) we're at ~$2FFA. A few more
+        // NOPs brings us right up to the boundary.
+        for _ in 0..3 { src.push_str("NOP\n"); }
+        // Reservation $3000-$33FF, then FAR sits past it.
+        src.push_str("LDA #$00\n");
+        src.push_str("FAR:\nNOP\n");
+        // This should assemble without the convergence loop
+        // hitting its guard — if the split-fixup is missing, we
+        // get "Long-branch fix didn't converge".
+        let result = a.assemble_bytes(&src);
+        assert!(result.is_ok(), "assembly should converge: {:?}", result.err());
     }
 
     #[test]
